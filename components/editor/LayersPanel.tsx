@@ -3,11 +3,12 @@
 import { useState, useRef, useCallback } from 'react';
 import { useProjectStore, createLayer } from '@/store/projectStore';
 import { useEditorStore } from '@/store/editorStore';
+import { getCanvasInstance } from '@/components/editor/Canvas';
 import type { Layer, BlendMode } from '@/store/types';
 import {
   Eye, EyeOff, Lock, LockOpen, Trash2, Copy, ChevronDown, ChevronRight,
   Plus, Layers, Image as ImageIcon, Type, Square, Film, FolderOpen,
-  MoveUp, MoveDown, Merge, Group, SlidersHorizontal, Palette,
+  MoveUp, MoveDown, Merge, Group, SlidersHorizontal, Palette, Locate,
 } from 'lucide-react';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -81,6 +82,25 @@ function LayerRow({
     else setNameVal(layer.name);
   };
 
+  const handleFocusOnCanvas = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const canvas = getCanvasInstance() as any;
+    if (!canvas) return;
+    const obj = canvas.getObjects().find((o: any) => o.data?.layerId === layer.id);
+    if (!obj) return;
+    canvas.setActiveObject(obj);
+    // Zoom-to-fit the object in the viewport
+    const zoom = canvas.getZoom();
+    const objCenter = obj.getCenterPoint();
+    const canvasWidth = canvas.getWidth();
+    const canvasHeight = canvas.getHeight();
+    const vpt = canvas.viewportTransform.slice();
+    vpt[4] = canvasWidth / 2 - objCenter.x * zoom;
+    vpt[5] = canvasHeight / 2 - objCenter.y * zoom;
+    canvas.setViewportTransform(vpt);
+    canvas.requestRenderAll();
+  };
+
   return (
     <div
       className={cn(
@@ -142,6 +162,15 @@ function LayerRow({
           </span>
         )}
       </div>
+
+      {/* Focus on canvas (navigate to object) */}
+      <button
+        onClick={handleFocusOnCanvas}
+        title="Перейти к объекту"
+        className="w-5 h-5 flex items-center justify-center text-muted-foreground/40 hover:text-primary transition-colors opacity-0 group-hover:opacity-100"
+      >
+        <Locate size={11} />
+      </button>
 
       {/* Lock */}
       <button onClick={handleLock} className="w-5 h-5 flex items-center justify-center text-muted-foreground/40 hover:text-muted-foreground transition-colors opacity-0 group-hover:opacity-100">

@@ -330,29 +330,37 @@ export default function Canvas() {
     if (existing) return;
 
     if (layer.type === 'image' && layer.src) {
-      return new Promise<void>((resolve) => {
-        fb.Image.fromURL(
-          layer.src,
-          (img: any) => {
-            if (!img) { resolve(); return; }
-            // Scale to fit canvas if the image is larger
-            const scaleX = layer.width ? layer.width / (img.width || 1) : 1;
-            const scaleY = layer.height ? layer.height / (img.height || 1) : 1;
-            img.set({
-              left: layer.x ?? 0,
-              top: layer.y ?? 0,
-              scaleX,
-              scaleY,
-              opacity: layer.opacity ?? 1,
-              angle: layer.rotation ?? 0,
-              data: { layerId: layer.id },
+      try {
+        // fabric v6 uses Promise-based fromURL
+        let img: any;
+        if (typeof fb.Image.fromURL === 'function') {
+          try {
+            img = await fb.Image.fromURL(layer.src, { crossOrigin: 'anonymous' });
+          } catch {
+            // fallback: try without options (older fabric)
+            img = await new Promise<any>((resolve) => {
+              fb.Image.fromURL(layer.src, (i: any) => resolve(i), { crossOrigin: 'anonymous' });
             });
-            canvas.add(img);
-            resolve();
-          },
-          { crossOrigin: 'anonymous' }
-        );
-      });
+          }
+        }
+        if (!img) return;
+        const scaleX = layer.width ? layer.width / (img.width || 1) : 1;
+        const scaleY = layer.height ? layer.height / (img.height || 1) : 1;
+        img.set({
+          left: layer.x ?? 0,
+          top: layer.y ?? 0,
+          scaleX,
+          scaleY,
+          opacity: layer.opacity ?? 1,
+          angle: layer.rotation ?? 0,
+          data: { layerId: layer.id },
+        });
+        canvas.add(img);
+        canvas.requestRenderAll();
+      } catch (err) {
+        console.error('[v0] renderLayerToCanvas image error:', err);
+      }
+      return;
     }
 
     if (layer.type === 'text') {
@@ -393,35 +401,39 @@ export default function Canvas() {
   async function addFileToCanvas(canvas: any, file: File, fb: any) {
     const url = URL.createObjectURL(file);
     if (file.type.startsWith('image/')) {
-      return new Promise<void>((resolve) => {
-        fb.Image.fromURL(
-          url,
-          (img: any) => {
-            if (!img) { resolve(); return; }
-            const w = img.width || 400;
-            const h = img.height || 300;
-            const layer = createLayer({
-              type: 'image',
-              name: file.name,
-              src: url,
-              x: 0, y: 0,
-              width: w,
-              height: h,
-            });
-            img.set({
-              left: 0, top: 0,
-              data: { layerId: layer.id },
-            });
-            canvas.add(img);
-            useProjectStore.getState().addLayer(layer);
-            // Mark as already on canvas so the layers watcher doesn't duplicate it
-            prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
-            canvas.requestRenderAll();
-            resolve();
-          },
-          { crossOrigin: 'anonymous' }
-        );
-      });
+      try {
+        let img: any;
+        try {
+          img = await fb.Image.fromURL(url, { crossOrigin: 'anonymous' });
+        } catch {
+          img = await new Promise<any>((resolve) => {
+            fb.Image.fromURL(url, (i: any) => resolve(i), { crossOrigin: 'anonymous' });
+          });
+        }
+        if (!img) return;
+        const w = img.width || 400;
+        const h = img.height || 300;
+        const layer = createLayer({
+          type: 'image',
+          name: file.name,
+          src: url,
+          x: 0, y: 0,
+          width: w,
+          height: h,
+        });
+        img.set({
+          left: 0, top: 0,
+          data: { layerId: layer.id },
+        });
+        canvas.add(img);
+        canvas.setActiveObject(img);
+        useProjectStore.getState().addLayer(layer);
+        prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
+        canvas.requestRenderAll();
+      } catch (err) {
+        console.error('[v0] addFileToCanvas error:', err);
+      }
+      return;
     }
 
     if (file.type.startsWith('video/')) {
