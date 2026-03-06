@@ -3,7 +3,7 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useProjectStore, createLayer } from '@/store/projectStore';
 import { useEditorStore } from '@/store/editorStore';
-import type { ToolType } from '@/store/types';
+import type { ToolType, Keyframe, AnimationTrack } from '@/store/types';
 
 let fabric: typeof import('fabric') | null = null;
 
@@ -22,18 +22,45 @@ export function getCanvasInstance() {
   return canvasInstance;
 }
 
+// ─── Keyframe interpolation ────────────────────────────────────────────────
+function lerp(a: number, b: number, t: number) {
+  return a + (b - a) * t;
+}
+
+function interpolateTrack(track: AnimationTrack, time: number): number | null {
+  const kfs = [...track.keyframes].sort((a, b) => a.time - b.time);
+  if (kfs.length === 0) return null;
+  if (time <= kfs[0].time) return kfs[0].value as number;
+  if (time >= kfs[kfs.length - 1].time) return kfs[kfs.length - 1].value as number;
+
+  for (let i = 0; i < kfs.length - 1; i++) {
+    const a = kfs[i];
+    const b = kfs[i + 1];
+    if (time >= a.time && time <= b.time) {
+      const t = (time - a.time) / (b.time - a.time);
+      return lerp(a.value as number, b.value as number, t);
+    }
+  }
+  return null;
+}
+
+// ─── Canvas component ──────────────────────────────────────────────────────
 export default function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const fabricRef = useRef<FabricCanvas | null>(null);
   const isDrawingRef = useRef(false);
   const initializedRef = useRef(false);
+  // Track whether last path was drawn with eraser mode
+  const eraserModeRef = useRef(false);
+  // Animation RAF handle
+  const animRafRef = useRef<number | null>(null);
 
   const { project, addLayer, updateLayer, setSelection, pushHistory } = useProjectStore();
   const {
     activeTool, zoom, showGrid, gridSize,
-    brushSettings, shapeSettings, textSettings,
-    setZoom, setPan, setActiveTool,
+    brushSettings, eraserSettings, shapeSettings, textSettings,
+    setZoom, setPan, setActiveTool, currentTime, timelinePlaying, setCurrentTime,
   } = useEditorStore();
 
   // Initialize Fabric.js canvas once
@@ -65,7 +92,6 @@ export default function Canvas() {
       fabricRef.current = canvas as unknown as FabricCanvas;
       canvasInstance = canvas as unknown as FabricCanvas;
 
-      // Fit canvas to container on init
       fitCanvasToContainer(canvas, containerRef.current);
 
       // Mouse wheel zoom
@@ -108,11 +134,44 @@ export default function Canvas() {
         pushHistory('Переместить объект');
       });
 
-      // Render any layers already in the store (e.g. file opened from start screen)
+      // ── path:created: register brush stroke as a layer ──────────────────
+      canvas.on('path:created', (e: any) => {
+        const path = e.path;
+        if (!path) return;
+        const wasEraser = eraserModeRef.current;
+        if (wasEraser) {
+          // Apply eraser compositing to the created path
+          path.set({
+            globalCompositeOperation: 'destination-out',
+            selectable: true,
+            evented: true,
+          });
+        }
+        // Register path as a layer in store so undo/history tracks it
+        const layerName = wasEraser ? 'Ластик' : 'Мазок кисти';
+        const layer = createLayer({
+          type: 'shape',
+          name: layerName,
+          x: Math.round(path.left ?? 0),
+          y: Math.round(path.top ?? 0),
+          width: Math.round(path.width ?? 10),
+          height: Math.round(path.height ?? 10),
+          fillColor: wasEraser ? 'transparent' : brushSettings.color,
+        });
+        path.set({ data: { layerId: layer.id } });
+        // We add the layer to the store but NOT re-render it from store
+        // (fabric already drew the path). Use the ref trick to prevent duplication.
+        useProjectStore.getState().addLayer(layer);
+        prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
+        pushHistory(layerName);
+      });
+
+      // Render any layers already in the store (e.g. project loaded from localStorage)
       const currentLayers = useProjectStore.getState().project.layers;
       for (const layer of [...currentLayers].reverse()) {
         await renderLayerToCanvas(canvas, layer, fb);
       }
+      prevLayerCountRef.current = currentLayers.length;
 
       canvas.requestRenderAll();
     })();
@@ -129,7 +188,7 @@ export default function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Watch project.layers — when a new layer is added to the store, add it to the canvas
+  // ── Watch project.layers — when a new layer is added to the store, add it to the canvas ──
   const prevLayerCountRef = useRef(0);
   useEffect(() => {
     const canvas = fabricRef.current as any;
@@ -141,11 +200,10 @@ export default function Canvas() {
     }
     prevLayerCountRef.current = layers.length;
 
-    // Find newly added layers (ones not yet on canvas)
     const existingIds = new Set(
       canvas.getObjects().map((o: any) => o.data?.layerId).filter(Boolean)
     );
-    const newLayers = layers.filter((l) => !existingIds.has(l.id));
+    const newLayers = layers.filter((l: any) => !existingIds.has(l.id));
 
     (async () => {
       const fb = await getFabric();
@@ -156,7 +214,80 @@ export default function Canvas() {
     })();
   }, [project.layers]);
 
-  // Fit canvas to container
+  // ── Sync store layer properties → existing fabric objects ────────────────
+  // When fillColor / strokeColor / text / textStyle / opacity change in the store,
+  // update the corresponding fabric object without re-adding it.
+  useEffect(() => {
+    const canvas = fabricRef.current as any;
+    if (!canvas) return;
+
+    for (const layer of project.layers) {
+      const obj = canvas.getObjects().find((o: any) => o.data?.layerId === layer.id);
+      if (!obj) continue;
+
+      let needsRender = false;
+
+      // Opacity
+      if (obj.opacity !== (layer.opacity ?? 1)) {
+        obj.set('opacity', layer.opacity ?? 1);
+        needsRender = true;
+      }
+
+      // Visibility
+      const shouldVisible = layer.visible !== false;
+      if (obj.visible !== shouldVisible) {
+        obj.set('visible', shouldVisible);
+        needsRender = true;
+      }
+
+      // Shape: fill / stroke
+      if (layer.type === 'shape') {
+        if (layer.fillColor && obj.fill !== layer.fillColor) {
+          obj.set('fill', layer.fillColor);
+          needsRender = true;
+        }
+        if (obj.stroke !== (layer.strokeColor ?? null)) {
+          obj.set('stroke', layer.strokeColor ?? null);
+          needsRender = true;
+        }
+        if (obj.strokeWidth !== (layer.strokeWidth ?? 0)) {
+          obj.set('strokeWidth', layer.strokeWidth ?? 0);
+          needsRender = true;
+        }
+      }
+
+      // Text: content + style
+      if (layer.type === 'text' && (obj as any).text !== undefined) {
+        if (layer.text !== undefined && (obj as any).text !== layer.text) {
+          (obj as any).set('text', layer.text);
+          needsRender = true;
+        }
+        const ts = layer.textStyle;
+        if (ts) {
+          if (obj.fill !== ts.color) { obj.set('fill', ts.color); needsRender = true; }
+          if ((obj as any).fontFamily !== ts.fontFamily) { (obj as any).set('fontFamily', ts.fontFamily); needsRender = true; }
+          if ((obj as any).fontSize !== ts.fontSize) { (obj as any).set('fontSize', ts.fontSize); needsRender = true; }
+          if ((obj as any).fontWeight !== ts.fontWeight) { (obj as any).set('fontWeight', String(ts.fontWeight)); needsRender = true; }
+          if ((obj as any).fontStyle !== ts.fontStyle) { (obj as any).set('fontStyle', ts.fontStyle); needsRender = true; }
+          if ((obj as any).textAlign !== ts.textAlign) { (obj as any).set('textAlign', ts.textAlign); needsRender = true; }
+          if ((obj as any).charSpacing !== ts.letterSpacing) { (obj as any).set('charSpacing', ts.letterSpacing); needsRender = true; }
+        }
+        // Also handle fillColor on text layers
+        if (layer.fillColor && obj.fill !== layer.fillColor) {
+          obj.set('fill', layer.fillColor);
+          needsRender = true;
+        }
+      }
+
+      if (needsRender) {
+        obj.setCoords?.();
+      }
+    }
+    canvas.requestRenderAll();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.layers]);
+
+  // ── Fit canvas to container ──────────────────────────────────────────────
   const fitCanvasToContainer = useCallback((canvas: any, container: HTMLDivElement | null) => {
     if (!container) return;
     const cw = container.clientWidth;
@@ -175,12 +306,89 @@ export default function Canvas() {
     setPan(vpX, vpY);
   }, [project.canvas.width, project.canvas.height, setZoom, setPan]);
 
-  // Handle tool changes
+  // ── Animation playback RAF loop ──────────────────────────────────────────
+  useEffect(() => {
+    if (animRafRef.current) {
+      cancelAnimationFrame(animRafRef.current);
+      animRafRef.current = null;
+    }
+    if (!timelinePlaying) return;
+
+    const duration = useProjectStore.getState().project.duration;
+    let lastTs: number | null = null;
+
+    const tick = (ts: number) => {
+      if (!fabricRef.current) return;
+      const canvas = fabricRef.current as any;
+      if (lastTs === null) lastTs = ts;
+      const dt = ts - lastTs;
+      lastTs = ts;
+
+      const store = useProjectStore.getState();
+      let t = useEditorStore.getState().currentTime + dt;
+      if (t >= duration) t = 0; // loop
+      useEditorStore.getState().setCurrentTime(t);
+
+      // Apply animation keyframes to fabric objects
+      for (const anim of store.project.animations) {
+        const obj = canvas.getObjects().find((o: any) => o.data?.layerId === anim.layerId);
+        if (!obj) continue;
+        let needsRender = false;
+        for (const track of anim.tracks) {
+          if (!track.enabled) continue;
+          const val = interpolateTrack(track, t);
+          if (val === null) continue;
+          switch (track.property) {
+            case 'opacity': obj.set('opacity', Math.max(0, Math.min(1, val))); needsRender = true; break;
+            case 'x': obj.set('left', val); needsRender = true; break;
+            case 'y': obj.set('top', val); needsRender = true; break;
+            case 'scaleX': obj.set('scaleX', val); needsRender = true; break;
+            case 'scaleY': obj.set('scaleY', val); needsRender = true; break;
+            case 'rotation': obj.set('angle', val); needsRender = true; break;
+          }
+        }
+        // Apply presets
+        for (const preset of anim.presets) {
+          const pStart = preset.startTime;
+          const pEnd = preset.startTime + preset.duration;
+          if (t < pStart || t > pEnd) continue;
+          const pt = (t - pStart) / preset.duration;
+          switch (preset.preset) {
+            case 'fade-in': obj.set('opacity', pt); needsRender = true; break;
+            case 'fade-out': obj.set('opacity', 1 - pt); needsRender = true; break;
+            case 'scale-up': obj.set('scaleX', pt); obj.set('scaleY', pt); needsRender = true; break;
+            case 'scale-down': obj.set('scaleX', 1 - pt * 0.5); obj.set('scaleY', 1 - pt * 0.5); needsRender = true; break;
+            case 'slide-in-left': obj.set('left', lerp(-obj.width, (obj as any)._origLeft ?? obj.left, pt)); needsRender = true; break;
+            case 'slide-in-right': {
+              const cw = canvas.getWidth();
+              obj.set('left', lerp(cw, (obj as any)._origLeft ?? obj.left, pt));
+              needsRender = true;
+              break;
+            }
+            case 'rotate-in': obj.set('angle', lerp(-180, 0, pt)); needsRender = true; break;
+            case 'blur-in':
+              // fabric doesn't have native blur filter anim easily; skip for now
+              break;
+          }
+        }
+        if (needsRender) obj.setCoords?.();
+      }
+      canvas.requestRenderAll();
+      animRafRef.current = requestAnimationFrame(tick);
+    };
+
+    animRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (animRafRef.current) cancelAnimationFrame(animRafRef.current);
+      animRafRef.current = null;
+    };
+  }, [timelinePlaying]);
+
+  // ── Handle tool changes ──────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
 
-    // Reset
     canvas.isDrawingMode = false;
     canvas.defaultCursor = 'default';
     canvas.hoverCursor = 'move';
@@ -188,6 +396,7 @@ export default function Canvas() {
     canvas.off('mouse:down');
     canvas.off('mouse:move');
     canvas.off('mouse:up');
+    eraserModeRef.current = false;
 
     switch (activeTool) {
       case 'select':
@@ -196,33 +405,33 @@ export default function Canvas() {
         canvas.defaultCursor = 'default';
         break;
 
-      case 'brush':
+      case 'brush': {
         canvas.isDrawingMode = true;
-        // freeDrawingBrush is always initialized in the setup useEffect
-        if (canvas.freeDrawingBrush) {
-          canvas.freeDrawingBrush.color = brushSettings.color;
-          canvas.freeDrawingBrush.width = brushSettings.size;
-        }
+        eraserModeRef.current = false;
+        (async () => {
+          const fb = await getFabric();
+          const brush = new fb.PencilBrush(canvas);
+          brush.color = brushSettings.color;
+          brush.width = brushSettings.size;
+          canvas.freeDrawingBrush = brush;
+        })();
         break;
+      }
 
-      case 'eraser':
+      case 'eraser': {
         canvas.isDrawingMode = true;
-        try {
-          const EraserBrush = (fabric as any)?.EraserBrush;
-          if (EraserBrush) {
-            canvas.freeDrawingBrush = new EraserBrush(canvas);
-          }
-          if (canvas.freeDrawingBrush) {
-            canvas.freeDrawingBrush.width = useEditorStore.getState().eraserSettings.size;
-          }
-        } catch {
-          // Fallback: use white pencil brush as eraser
-          if (canvas.freeDrawingBrush) {
-            canvas.freeDrawingBrush.color = '#1a1a1f';
-            canvas.freeDrawingBrush.width = useEditorStore.getState().eraserSettings.size;
-          }
-        }
+        eraserModeRef.current = true;
+        // Use PencilBrush with destination-out compositing applied on path:created
+        (async () => {
+          const fb = await getFabric();
+          const brush = new fb.PencilBrush(canvas);
+          // Draw with semi-transparent black; we apply destination-out on path:created
+          brush.color = 'rgba(0,0,0,1)';
+          brush.width = eraserSettings.size;
+          canvas.freeDrawingBrush = brush;
+        })();
         break;
+      }
 
       case 'hand':
         canvas.defaultCursor = 'grab';
@@ -269,9 +478,9 @@ export default function Canvas() {
 
     canvas.requestRenderAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTool, brushSettings, shapeSettings, textSettings]);
+  }, [activeTool, brushSettings, eraserSettings, shapeSettings, textSettings]);
 
-  // Sync zoom from store
+  // ── Sync zoom from store ─────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
@@ -282,14 +491,14 @@ export default function Canvas() {
     }
   }, [zoom]);
 
-  // Grid overlay
+  // ── Grid overlay ─────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
     renderGrid(canvas, showGrid, gridSize, project.canvas);
   }, [showGrid, gridSize, project.canvas]);
 
-  // Drag and drop onto canvas container
+  // ── Drag and drop onto canvas container ─────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -322,26 +531,21 @@ export default function Canvas() {
     };
   }, []);
 
-  // ----- Helpers -----
+  // ─── Helpers ──────────────────────────────────────────────────────────────
 
   async function renderLayerToCanvas(canvas: any, layer: any, fb: any) {
-    // Skip if already on canvas
     const existing = canvas.getObjects().find((o: any) => o.data?.layerId === layer.id);
     if (existing) return;
 
     if (layer.type === 'image' && layer.src) {
       try {
-        // fabric v6 uses Promise-based fromURL
         let img: any;
-        if (typeof fb.Image.fromURL === 'function') {
-          try {
-            img = await fb.Image.fromURL(layer.src, { crossOrigin: 'anonymous' });
-          } catch {
-            // fallback: try without options (older fabric)
-            img = await new Promise<any>((resolve) => {
-              fb.Image.fromURL(layer.src, (i: any) => resolve(i), { crossOrigin: 'anonymous' });
-            });
-          }
+        try {
+          img = await fb.Image.fromURL(layer.src, { crossOrigin: 'anonymous' });
+        } catch {
+          img = await new Promise<any>((resolve) => {
+            fb.Image.fromURL(layer.src, (i: any) => resolve(i), { crossOrigin: 'anonymous' });
+          });
         }
         if (!img) return;
         const scaleX = layer.width ? layer.width / (img.width || 1) : 1;
@@ -364,14 +568,19 @@ export default function Canvas() {
     }
 
     if (layer.type === 'text') {
+      const ts = layer.textStyle;
       const text = new (fb as any).IText(layer.text || 'Текст', {
         left: layer.x ?? 0,
         top: layer.y ?? 0,
-        fontFamily: layer.fontFamily ?? 'Inter',
-        fontSize: layer.fontSize ?? 48,
-        fill: layer.fillColor ?? '#ffffff',
+        fontFamily: ts?.fontFamily ?? layer.fontFamily ?? 'Inter',
+        fontSize: ts?.fontSize ?? layer.fontSize ?? 48,
+        fontWeight: ts?.fontWeight ? String(ts.fontWeight) : '700',
+        fontStyle: ts?.fontStyle ?? 'normal',
+        textAlign: ts?.textAlign ?? 'left',
+        fill: ts?.color ?? layer.fillColor ?? '#ffffff',
         opacity: layer.opacity ?? 1,
         angle: layer.rotation ?? 0,
+        editable: true,
         data: { layerId: layer.id },
       });
       canvas.add(text);
@@ -383,7 +592,7 @@ export default function Canvas() {
         left: layer.x ?? 0,
         top: layer.y ?? 0,
         fill: layer.fillColor ?? '#4d9bff',
-        stroke: layer.strokeColor,
+        stroke: layer.strokeColor ?? null,
         strokeWidth: layer.strokeWidth ?? 0,
         opacity: layer.opacity ?? 1,
         angle: layer.rotation ?? 0,
@@ -541,6 +750,20 @@ export default function Canvas() {
           y: Math.round(pointer.y),
           width: 300, height: 60,
           fillColor: ts.color,
+          textStyle: {
+            fontFamily: ts.fontFamily,
+            fontSize: ts.fontSize,
+            fontWeight: ts.fontWeight,
+            fontStyle: ts.fontStyle,
+            textDecoration: '',
+            textAlign: ts.textAlign,
+            lineHeight: ts.lineHeight,
+            letterSpacing: ts.letterSpacing,
+            color: ts.color,
+            stroke: '',
+            strokeWidth: 0,
+            shadow: null,
+          },
         });
         text.set({ data: { layerId: layer.id } });
         canvas.add(text);

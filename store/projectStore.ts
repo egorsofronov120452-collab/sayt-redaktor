@@ -2,6 +2,7 @@
 
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
+import { persist, createJSONStorage } from 'zustand/middleware';
 import { nanoid } from 'nanoid';
 import type {
   Project, Layer, LayerAnimation, CanvasSize,
@@ -110,6 +111,7 @@ interface ProjectState {
 }
 
 export const useProjectStore = create<ProjectState>()(
+  persist(
   immer((set, get) => ({
     project: createDefaultProject(),
     history: [],
@@ -335,5 +337,19 @@ export const useProjectStore = create<ProjectState>()(
     setExportSettings: (settings) => {
       set((s) => { Object.assign(s.exportSettings, settings); });
     },
-  }))
+  })),
+  {
+    name: 'motioncraft-project',
+    storage: createJSONStorage(() => {
+      // Safe localStorage access (SSR guard)
+      if (typeof window === 'undefined') return { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+      return localStorage;
+    }),
+    // Only persist project + exportSettings; skip history & selection (too large / stale)
+    partialize: (state) => ({
+      project: state.project,
+      exportSettings: state.exportSettings,
+    }),
+  }
+  )
 );
