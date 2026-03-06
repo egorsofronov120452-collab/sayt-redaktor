@@ -303,12 +303,12 @@ export default function EditorShell() {
       if (e.ctrlKey && e.key === 'e') { e.preventDefault(); setShowExport(true); }
     };
     const openExportHandler = () => setShowExport(true);
-    window.addEventListener('open-export', openExportHandler);
-    // Re-register keydown with correct handler below (just add the removeEventListener)
-    const cleanup2 = () => window.removeEventListener('open-export', openExportHandler);
-    };
     window.addEventListener('keydown', handler);
-    return () => { window.removeEventListener('keydown', handler); cleanup2(); };
+    window.addEventListener('open-export', openExportHandler);
+    return () => {
+      window.removeEventListener('keydown', handler);
+      window.removeEventListener('open-export', openExportHandler);
+    };
   }, []);
 
   const handleRightDrag = useCallback((delta: number) => {
