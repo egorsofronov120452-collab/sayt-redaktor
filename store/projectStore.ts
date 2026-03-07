@@ -26,10 +26,19 @@ const DEFAULT_ADJUSTMENTS = (): NonNullable<Layer['adjustments']> => ({
   temperature: 0, tint: 0, sharpness: 0, clarity: 0, dehaze: 0, vignette: 0,
 });
 
+const PROJECT_ADJECTIVES = ['Яркий', 'Тёмный', 'Синий', 'Золотой', 'Космический', 'Лесной', 'Городской', 'Дикий', 'Тихий', 'Бурный', 'Утренний', 'Ночной', 'Стремительный', 'Мягкий', 'Резкий'];
+const PROJECT_NOUNS = ['Проект', 'Кадр', 'Сцена', 'Момент', 'Мир', 'Взгляд', 'Горизонт', 'Портрет', 'Этюд', 'Эскиз', 'Рассвет', 'Закат', 'Видение', 'Образ', 'Вспышка'];
+
+function randomProjectName(): string {
+  const adj = PROJECT_ADJECTIVES[Math.floor(Math.random() * PROJECT_ADJECTIVES.length)];
+  const noun = PROJECT_NOUNS[Math.floor(Math.random() * PROJECT_NOUNS.length)];
+  return `${adj} ${noun}`;
+}
+
 function createDefaultProject(): Project {
   return {
     id: nanoid(),
-    name: 'Новый проект',
+    name: randomProjectName(),
     createdAt: Date.now(),
     updatedAt: Date.now(),
     canvas: { width: 1920, height: 1080, name: '1920×1080 Full HD' },

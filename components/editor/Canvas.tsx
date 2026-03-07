@@ -44,6 +44,51 @@ function interpolateTrack(track: AnimationTrack, time: number): number | null {
   return null;
 }
 
+// ─── Apply fabric Shadow/Glow from layer effects ──────────────────────────
+async function applyEffectsToObject(obj: any, layer: import('@/store/types').Layer, fb: any) {
+  const fx = layer.effects;
+  if (!fx) return;
+
+  // Drop Shadow
+  if (fx.dropShadow?.enabled) {
+    try {
+      obj.shadow = new fb.Shadow({
+        color: fx.dropShadow.color,
+        blur: fx.dropShadow.blur,
+        offsetX: fx.dropShadow.offsetX,
+        offsetY: fx.dropShadow.offsetY,
+        affectStroke: false,
+      });
+    } catch {
+      // fabric v5 compat
+      obj.set('shadow', `${fx.dropShadow.color} ${fx.dropShadow.offsetX}px ${fx.dropShadow.offsetY}px ${fx.dropShadow.blur}px`);
+    }
+  } else if (!fx.dropShadow?.enabled && obj.shadow) {
+    obj.shadow = null;
+  }
+
+  // Outer Glow — implemented via large shadow with 0 offset
+  if (fx.outerGlow?.enabled) {
+    try {
+      obj.shadow = new fb.Shadow({
+        color: fx.outerGlow.color,
+        blur: fx.outerGlow.blur * 2,
+        offsetX: 0,
+        offsetY: 0,
+      });
+    } catch {
+      obj.set('shadow', `${fx.outerGlow.color} 0px 0px ${fx.outerGlow.blur * 2}px`);
+    }
+  }
+
+  // Stroke from effects panel (overrides shape strokeWidth)
+  if (fx.stroke?.enabled) {
+    obj.set('stroke', fx.stroke.color);
+    obj.set('strokeWidth', fx.stroke.width);
+    obj.set('strokeUniform', true);
+  }
+}
+
 // ─── Canvas component ──────────────────────────────────────────────────────
 export default function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -51,10 +96,11 @@ export default function Canvas() {
   const fabricRef = useRef<FabricCanvas | null>(null);
   const isDrawingRef = useRef(false);
   const initializedRef = useRef(false);
-  // Track whether last path was drawn with eraser mode
   const eraserModeRef = useRef(false);
-  // Animation RAF handle
   const animRafRef = useRef<number | null>(null);
+  // clone stamp source point
+  const cloneSourceRef = useRef<{ x: number; y: number } | null>(null);
+  const cloneImageDataRef = useRef<ImageData | null>(null);
 
   const { project, addLayer, updateLayer, setSelection, pushHistory } = useProjectStore();
   const {
@@ -84,7 +130,6 @@ export default function Canvas() {
         renderOnAddRemove: true,
       });
 
-      // Initialize PencilBrush immediately so freeDrawingBrush is never undefined
       canvas.freeDrawingBrush = new fb.PencilBrush(canvas);
       canvas.freeDrawingBrush.color = brushSettings.color;
       canvas.freeDrawingBrush.width = brushSettings.size;
@@ -134,20 +179,18 @@ export default function Canvas() {
         pushHistory('Переместить объект');
       });
 
-      // ── path:created: register brush stroke as a layer ──────────────────
+      // path:created — register brush/eraser stroke as a layer
       canvas.on('path:created', (e: any) => {
         const path = e.path;
         if (!path) return;
         const wasEraser = eraserModeRef.current;
         if (wasEraser) {
-          // Apply eraser compositing to the created path
           path.set({
             globalCompositeOperation: 'destination-out',
             selectable: true,
             evented: true,
           });
         }
-        // Register path as a layer in store so undo/history tracks it
         const layerName = wasEraser ? 'Ластик' : 'Мазок кисти';
         const layer = createLayer({
           type: 'shape',
@@ -159,20 +202,19 @@ export default function Canvas() {
           fillColor: wasEraser ? 'transparent' : brushSettings.color,
         });
         path.set({ data: { layerId: layer.id } });
-        // We add the layer to the store but NOT re-render it from store
-        // (fabric already drew the path). Use the ref trick to prevent duplication.
         useProjectStore.getState().addLayer(layer);
         prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
         pushHistory(layerName);
+        // Return to select after drawing
+        useEditorStore.getState().setActiveTool('select');
       });
 
-      // Render any layers already in the store (e.g. project loaded from localStorage)
+      // Render layers from store (persisted project)
       const currentLayers = useProjectStore.getState().project.layers;
       for (const layer of [...currentLayers].reverse()) {
         await renderLayerToCanvas(canvas, layer, fb);
       }
       prevLayerCountRef.current = currentLayers.length;
-
       canvas.requestRenderAll();
     })();
 
@@ -188,7 +230,7 @@ export default function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Watch project.layers — when a new layer is added to the store, add it to the canvas ──
+  // ── Watch project.layers — add new layers to canvas ──────────────────────
   const prevLayerCountRef = useRef(0);
   useEffect(() => {
     const canvas = fabricRef.current as any;
@@ -214,80 +256,107 @@ export default function Canvas() {
     })();
   }, [project.layers]);
 
-  // ── Sync store layer properties → existing fabric objects ────────────────
-  // When fillColor / strokeColor / text / textStyle / opacity change in the store,
-  // update the corresponding fabric object without re-adding it.
+  // ── Remove deleted layers from canvas ─────────────────────────────────────
+  useEffect(() => {
+    const canvas = fabricRef.current as any;
+    if (!canvas) return;
+    const layerIds = new Set(project.layers.map((l: any) => l.id));
+    const toRemove = canvas.getObjects().filter((o: any) => o.data?.layerId && !layerIds.has(o.data.layerId));
+    if (toRemove.length > 0) {
+      toRemove.forEach((o: any) => canvas.remove(o));
+      canvas.requestRenderAll();
+    }
+  }, [project.layers]);
+
+  // ── Sync store layer properties → existing fabric objects ─────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
 
-    for (const layer of project.layers) {
-      const obj = canvas.getObjects().find((o: any) => o.data?.layerId === layer.id);
-      if (!obj) continue;
+    (async () => {
+      const fb = await getFabric();
+      for (const layer of project.layers) {
+        const obj = canvas.getObjects().find((o: any) => o.data?.layerId === layer.id);
+        if (!obj) continue;
 
-      let needsRender = false;
+        let needsRender = false;
 
-      // Opacity
-      if (obj.opacity !== (layer.opacity ?? 1)) {
-        obj.set('opacity', layer.opacity ?? 1);
-        needsRender = true;
-      }
-
-      // Visibility
-      const shouldVisible = layer.visible !== false;
-      if (obj.visible !== shouldVisible) {
-        obj.set('visible', shouldVisible);
-        needsRender = true;
-      }
-
-      // Shape: fill / stroke
-      if (layer.type === 'shape') {
-        if (layer.fillColor && obj.fill !== layer.fillColor) {
-          obj.set('fill', layer.fillColor);
+        // Opacity
+        if (obj.opacity !== (layer.opacity ?? 1)) {
+          obj.set('opacity', layer.opacity ?? 1);
           needsRender = true;
         }
-        if (obj.stroke !== (layer.strokeColor ?? null)) {
-          obj.set('stroke', layer.strokeColor ?? null);
-          needsRender = true;
-        }
-        if (obj.strokeWidth !== (layer.strokeWidth ?? 0)) {
-          obj.set('strokeWidth', layer.strokeWidth ?? 0);
-          needsRender = true;
-        }
-      }
 
-      // Text: content + style
-      if (layer.type === 'text' && (obj as any).text !== undefined) {
-        if (layer.text !== undefined && (obj as any).text !== layer.text) {
-          (obj as any).set('text', layer.text);
+        // Visibility
+        const shouldVisible = layer.visible !== false;
+        if (obj.visible !== shouldVisible) {
+          obj.set('visible', shouldVisible);
           needsRender = true;
         }
-        const ts = layer.textStyle;
-        if (ts) {
-          if (obj.fill !== ts.color) { obj.set('fill', ts.color); needsRender = true; }
-          if ((obj as any).fontFamily !== ts.fontFamily) { (obj as any).set('fontFamily', ts.fontFamily); needsRender = true; }
-          if ((obj as any).fontSize !== ts.fontSize) { (obj as any).set('fontSize', ts.fontSize); needsRender = true; }
-          if ((obj as any).fontWeight !== ts.fontWeight) { (obj as any).set('fontWeight', String(ts.fontWeight)); needsRender = true; }
-          if ((obj as any).fontStyle !== ts.fontStyle) { (obj as any).set('fontStyle', ts.fontStyle); needsRender = true; }
-          if ((obj as any).textAlign !== ts.textAlign) { (obj as any).set('textAlign', ts.textAlign); needsRender = true; }
-          if ((obj as any).charSpacing !== ts.letterSpacing) { (obj as any).set('charSpacing', ts.letterSpacing); needsRender = true; }
-        }
-        // Also handle fillColor on text layers
-        if (layer.fillColor && obj.fill !== layer.fillColor) {
-          obj.set('fill', layer.fillColor);
-          needsRender = true;
-        }
-      }
 
-      if (needsRender) {
-        obj.setCoords?.();
+        // Flip
+        if (obj.flipX !== (layer.flipX ?? false)) { obj.set('flipX', layer.flipX ?? false); needsRender = true; }
+        if (obj.flipY !== (layer.flipY ?? false)) { obj.set('flipY', layer.flipY ?? false); needsRender = true; }
+
+        // Shape: fill / stroke (only update fill, don't change stroke blindly)
+        if (layer.type === 'shape') {
+          const newFill = layer.fillColor ?? '#4d9bff';
+          if (obj.fill !== newFill && layer.fillColor) {
+            obj.set('fill', newFill);
+            needsRender = true;
+          }
+          // Only apply strokeColor if it's explicitly set on the layer (not from effects)
+          const newStroke = layer.strokeColor ?? null;
+          const newStrokeWidth = layer.strokeWidth ?? 0;
+          if (obj.stroke !== newStroke) { obj.set('stroke', newStroke); obj.set('strokeUniform', true); needsRender = true; }
+          if (obj.strokeWidth !== newStrokeWidth) { obj.set('strokeWidth', newStrokeWidth); needsRender = true; }
+        }
+
+        // Text: content + style
+        if (layer.type === 'text' && obj.text !== undefined) {
+          if (layer.text !== undefined && obj.text !== layer.text) {
+            obj.set('text', layer.text);
+            needsRender = true;
+          }
+          const ts = layer.textStyle;
+          if (ts) {
+            if (obj.fill !== ts.color) { obj.set('fill', ts.color); needsRender = true; }
+            if (obj.fontFamily !== ts.fontFamily) { obj.set('fontFamily', ts.fontFamily); needsRender = true; }
+            if (obj.fontSize !== ts.fontSize) { obj.set('fontSize', ts.fontSize); needsRender = true; }
+            if (obj.fontWeight !== String(ts.fontWeight)) { obj.set('fontWeight', String(ts.fontWeight)); needsRender = true; }
+            if (obj.fontStyle !== ts.fontStyle) { obj.set('fontStyle', ts.fontStyle); needsRender = true; }
+            if (obj.textAlign !== ts.textAlign) { obj.set('textAlign', ts.textAlign); needsRender = true; }
+            if (obj.charSpacing !== ts.letterSpacing) { obj.set('charSpacing', ts.letterSpacing); needsRender = true; }
+            if (obj.underline !== (ts.textDecoration === 'underline')) { obj.set('underline', ts.textDecoration === 'underline'); needsRender = true; }
+            // Text stroke (outline)
+            if (ts.strokeWidth > 0) {
+              obj.set('stroke', ts.stroke || '#000000');
+              obj.set('strokeWidth', ts.strokeWidth);
+            } else {
+              obj.set('stroke', null);
+              obj.set('strokeWidth', 0);
+            }
+          }
+          // fillColor on text as fallback
+          if (layer.fillColor && !layer.textStyle) {
+            obj.set('fill', layer.fillColor);
+            needsRender = true;
+          }
+        }
+
+        // Apply layer effects (shadow, glow, stroke from effects panel)
+        await applyEffectsToObject(obj, layer, fb);
+
+        if (needsRender) {
+          obj.setCoords?.();
+        }
       }
-    }
-    canvas.requestRenderAll();
+      canvas.requestRenderAll();
+    })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.layers]);
 
-  // ── Fit canvas to container ──────────────────────────────────────────────
+  // ── Fit canvas to container ───────────────────────────────────────────────
   const fitCanvasToContainer = useCallback((canvas: any, container: HTMLDivElement | null) => {
     if (!container) return;
     const cw = container.clientWidth;
@@ -306,7 +375,7 @@ export default function Canvas() {
     setPan(vpX, vpY);
   }, [project.canvas.width, project.canvas.height, setZoom, setPan]);
 
-  // ── Animation playback RAF loop ──────────────────────────────────────────
+  // ── Animation playback RAF loop ───────────────────────────────────────────
   useEffect(() => {
     if (animRafRef.current) {
       cancelAnimationFrame(animRafRef.current);
@@ -326,52 +395,41 @@ export default function Canvas() {
 
       const store = useProjectStore.getState();
       let t = useEditorStore.getState().currentTime + dt;
-      if (t >= duration) t = 0; // loop
+      if (t >= duration) t = 0;
       useEditorStore.getState().setCurrentTime(t);
 
-      // Apply animation keyframes to fabric objects
       for (const anim of store.project.animations) {
         const obj = canvas.getObjects().find((o: any) => o.data?.layerId === anim.layerId);
         if (!obj) continue;
-        let needsRender = false;
         for (const track of anim.tracks) {
           if (!track.enabled) continue;
           const val = interpolateTrack(track, t);
           if (val === null) continue;
           switch (track.property) {
-            case 'opacity': obj.set('opacity', Math.max(0, Math.min(1, val))); needsRender = true; break;
-            case 'x': obj.set('left', val); needsRender = true; break;
-            case 'y': obj.set('top', val); needsRender = true; break;
-            case 'scaleX': obj.set('scaleX', val); needsRender = true; break;
-            case 'scaleY': obj.set('scaleY', val); needsRender = true; break;
-            case 'rotation': obj.set('angle', val); needsRender = true; break;
+            case 'opacity': obj.set('opacity', Math.max(0, Math.min(1, val))); break;
+            case 'x': obj.set('left', val); break;
+            case 'y': obj.set('top', val); break;
+            case 'scaleX': obj.set('scaleX', val); break;
+            case 'scaleY': obj.set('scaleY', val); break;
+            case 'rotation': obj.set('angle', val); break;
           }
+          obj.setCoords?.();
         }
-        // Apply presets
         for (const preset of anim.presets) {
           const pStart = preset.startTime;
           const pEnd = preset.startTime + preset.duration;
           if (t < pStart || t > pEnd) continue;
           const pt = (t - pStart) / preset.duration;
           switch (preset.preset) {
-            case 'fade-in': obj.set('opacity', pt); needsRender = true; break;
-            case 'fade-out': obj.set('opacity', 1 - pt); needsRender = true; break;
-            case 'scale-up': obj.set('scaleX', pt); obj.set('scaleY', pt); needsRender = true; break;
-            case 'scale-down': obj.set('scaleX', 1 - pt * 0.5); obj.set('scaleY', 1 - pt * 0.5); needsRender = true; break;
-            case 'slide-in-left': obj.set('left', lerp(-obj.width, (obj as any)._origLeft ?? obj.left, pt)); needsRender = true; break;
-            case 'slide-in-right': {
-              const cw = canvas.getWidth();
-              obj.set('left', lerp(cw, (obj as any)._origLeft ?? obj.left, pt));
-              needsRender = true;
-              break;
-            }
-            case 'rotate-in': obj.set('angle', lerp(-180, 0, pt)); needsRender = true; break;
-            case 'blur-in':
-              // fabric doesn't have native blur filter anim easily; skip for now
-              break;
+            case 'fade-in': obj.set('opacity', pt); break;
+            case 'fade-out': obj.set('opacity', 1 - pt); break;
+            case 'scale-up': obj.set('scaleX', pt); obj.set('scaleY', pt); break;
+            case 'slide-in-left': obj.set('left', lerp(-obj.width, (obj as any)._origLeft ?? obj.left, pt)); break;
+            case 'slide-in-right': obj.set('left', lerp(canvas.getWidth(), (obj as any)._origLeft ?? obj.left, pt)); break;
+            case 'rotate-in': obj.set('angle', lerp(-180, 0, pt)); break;
           }
+          obj.setCoords?.();
         }
-        if (needsRender) obj.setCoords?.();
       }
       canvas.requestRenderAll();
       animRafRef.current = requestAnimationFrame(tick);
@@ -384,11 +442,12 @@ export default function Canvas() {
     };
   }, [timelinePlaying]);
 
-  // ── Handle tool changes ──────────────────────────────────────────────────
+  // ── Handle tool changes ───────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
 
+    // Reset all modes
     canvas.isDrawingMode = false;
     canvas.defaultCursor = 'default';
     canvas.hoverCursor = 'move';
@@ -397,6 +456,12 @@ export default function Canvas() {
     canvas.off('mouse:move');
     canvas.off('mouse:up');
     eraserModeRef.current = false;
+    // Re-enable object interactivity for non-drawing tools
+    canvas.getObjects().forEach((o: any) => {
+      if (o.data?.isGrid) return;
+      o.selectable = true;
+      o.evented = true;
+    });
 
     switch (activeTool) {
       case 'select':
@@ -413,6 +478,7 @@ export default function Canvas() {
           const brush = new fb.PencilBrush(canvas);
           brush.color = brushSettings.color;
           brush.width = brushSettings.size;
+          (brush as any).opacity = brushSettings.opacity;
           canvas.freeDrawingBrush = brush;
         })();
         break;
@@ -421,11 +487,9 @@ export default function Canvas() {
       case 'eraser': {
         canvas.isDrawingMode = true;
         eraserModeRef.current = true;
-        // Use PencilBrush with destination-out compositing applied on path:created
         (async () => {
           const fb = await getFabric();
           const brush = new fb.PencilBrush(canvas);
-          // Draw with semi-transparent black; we apply destination-out on path:created
           brush.color = 'rgba(0,0,0,1)';
           brush.width = eraserSettings.size;
           canvas.freeDrawingBrush = brush;
@@ -436,18 +500,21 @@ export default function Canvas() {
       case 'hand':
         canvas.defaultCursor = 'grab';
         canvas.selection = false;
+        canvas.getObjects().forEach((o: any) => { o.selectable = false; o.evented = false; });
         setupPanTool(canvas);
         break;
 
       case 'eyedropper':
         canvas.defaultCursor = 'crosshair';
         canvas.selection = false;
+        canvas.getObjects().forEach((o: any) => { o.selectable = false; o.evented = false; });
         setupEyedropper(canvas);
         break;
 
       case 'zoom':
         canvas.defaultCursor = 'zoom-in';
         canvas.selection = false;
+        canvas.getObjects().forEach((o: any) => { o.selectable = false; o.evented = false; });
         canvas.on('mouse:down', async (opt: any) => {
           const fb = await getFabric();
           const alt = opt.e.altKey;
@@ -470,9 +537,34 @@ export default function Canvas() {
         setupShapeTool(canvas);
         break;
 
+      case 'lasso':
+        canvas.selection = false;
+        canvas.defaultCursor = 'crosshair';
+        setupLassoTool(canvas);
+        break;
+
       case 'crop':
         canvas.selection = false;
         canvas.defaultCursor = 'crosshair';
+        setupCropTool(canvas);
+        break;
+
+      case 'clone':
+        canvas.selection = false;
+        canvas.defaultCursor = 'crosshair';
+        setupCloneTool(canvas);
+        break;
+
+      case 'magic-wand':
+        // Magic wand selects similar color areas; for now just select clicked object
+        canvas.selection = true;
+        canvas.defaultCursor = 'crosshair';
+        break;
+
+      case 'gradient':
+        canvas.selection = false;
+        canvas.defaultCursor = 'crosshair';
+        setupGradientTool(canvas);
         break;
     }
 
@@ -480,7 +572,7 @@ export default function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTool, brushSettings, eraserSettings, shapeSettings, textSettings]);
 
-  // ── Sync zoom from store ─────────────────────────────────────────────────
+  // ── Sync zoom from store ──────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
@@ -491,14 +583,14 @@ export default function Canvas() {
     }
   }, [zoom]);
 
-  // ── Grid overlay ─────────────────────────────────────────────────────────
+  // ── Grid overlay ──────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
     renderGrid(canvas, showGrid, gridSize, project.canvas);
   }, [showGrid, gridSize, project.canvas]);
 
-  // ── Drag and drop onto canvas container ─────────────────────────────────
+  // ── Drag and drop onto canvas container ──────────────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -559,6 +651,7 @@ export default function Canvas() {
           angle: layer.rotation ?? 0,
           data: { layerId: layer.id },
         });
+        await applyEffectsToObject(img, layer, fb);
         canvas.add(img);
         canvas.requestRenderAll();
       } catch (err) {
@@ -572,8 +665,8 @@ export default function Canvas() {
       const text = new (fb as any).IText(layer.text || 'Текст', {
         left: layer.x ?? 0,
         top: layer.y ?? 0,
-        fontFamily: ts?.fontFamily ?? layer.fontFamily ?? 'Inter',
-        fontSize: ts?.fontSize ?? layer.fontSize ?? 48,
+        fontFamily: ts?.fontFamily ?? 'Inter',
+        fontSize: ts?.fontSize ?? 48,
         fontWeight: ts?.fontWeight ? String(ts.fontWeight) : '700',
         fontStyle: ts?.fontStyle ?? 'normal',
         textAlign: ts?.textAlign ?? 'left',
@@ -583,6 +676,7 @@ export default function Canvas() {
         editable: true,
         data: { layerId: layer.id },
       });
+      await applyEffectsToObject(text, layer, fb);
       canvas.add(text);
     }
 
@@ -594,16 +688,50 @@ export default function Canvas() {
         fill: layer.fillColor ?? '#4d9bff',
         stroke: layer.strokeColor ?? null,
         strokeWidth: layer.strokeWidth ?? 0,
+        strokeUniform: true,
         opacity: layer.opacity ?? 1,
         angle: layer.rotation ?? 0,
         data: { layerId: layer.id },
       };
       if (layer.shapeType === 'circle') {
         shape = new fb.Ellipse({ ...commonProps, rx: (layer.width ?? 100) / 2, ry: (layer.height ?? 100) / 2 });
+      } else if (['line', 'arrow'].includes(layer.shapeType)) {
+        shape = new (fb as any).Line([0, 0, layer.width ?? 100, 0], { ...commonProps });
       } else {
         shape = new fb.Rect({ ...commonProps, width: layer.width ?? 100, height: layer.height ?? 100 });
       }
+      await applyEffectsToObject(shape, layer, fb);
       canvas.add(shape);
+    }
+
+    // Gradient layer
+    if (layer.type === 'gradient' && layer.gradient) {
+      const g = layer.gradient;
+      const rect = new fb.Rect({
+        left: layer.x ?? 0, top: layer.y ?? 0,
+        width: layer.width ?? project.canvas.width,
+        height: layer.height ?? project.canvas.height,
+        opacity: layer.opacity ?? 1,
+        angle: layer.rotation ?? 0,
+        selectable: true,
+        data: { layerId: layer.id },
+      });
+      if (g.type === 'linear') {
+        rect.set('fill', new fb.Gradient({
+          type: 'linear',
+          gradientUnits: 'percentage',
+          coords: { x1: 0, y1: 0, x2: 1, y2: 0 },
+          colorStops: g.stops.map((s: any) => ({ offset: s.offset, color: s.color, opacity: s.opacity })),
+        }));
+      } else {
+        rect.set('fill', new fb.Gradient({
+          type: 'radial',
+          gradientUnits: 'percentage',
+          coords: { x1: 0.5, y1: 0.5, r1: 0, x2: 0.5, y2: 0.5, r2: 0.5 },
+          colorStops: g.stops.map((s: any) => ({ offset: s.offset, color: s.color, opacity: s.opacity })),
+        }));
+      }
+      canvas.add(rect);
     }
   }
 
@@ -651,31 +779,45 @@ export default function Canvas() {
       videoEl.crossOrigin = 'anonymous';
       videoEl.loop = true;
       videoEl.muted = true;
+      videoEl.playsInline = true;
       await new Promise<void>((res) => {
         videoEl.onloadedmetadata = () => res();
         videoEl.onerror = () => res();
+        setTimeout(res, 3000);
       });
+      const vw = videoEl.videoWidth || 1280;
+      const vh = videoEl.videoHeight || 720;
       const layer = createLayer({
         type: 'video',
         name: file.name,
         src: url,
-        width: videoEl.videoWidth || 1280,
-        height: videoEl.videoHeight || 720,
+        width: vw,
+        height: vh,
         videoEnd: (videoEl.duration || 10) * 1000,
       });
       const vidObj = new fb.Image(videoEl, {
         left: 0, top: 0,
+        width: vw,
+        height: vh,
         objectCaching: false,
         data: { layerId: layer.id },
       });
       canvas.add(vidObj);
-      videoEl.play();
+      canvas.setActiveObject(vidObj);
+
+      // Video render loop
       const animate = () => {
         if (!fabricRef.current) return;
+        vidObj.set('dirty', true);
         canvas.requestRenderAll();
         requestAnimationFrame(animate);
       };
-      animate();
+
+      videoEl.play().then(() => animate()).catch(() => {
+        // autoplay blocked — user must click play
+        animate();
+      });
+
       useProjectStore.getState().addLayer(layer);
       prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
     }
@@ -708,16 +850,28 @@ export default function Canvas() {
 
   function setupEyedropper(canvas: any) {
     canvas.on('mouse:down', (opt: any) => {
-      const pointer = canvas.getPointer(opt.e);
-      const ctx = (canvas as any).getContext?.();
+      // Get the underlying HTML canvas element and read pixel color
+      const el: HTMLCanvasElement = (canvas as any).getElement?.() ?? canvasRef.current;
+      if (!el) return;
+      const ctx = el.getContext('2d');
       if (!ctx) return;
-      const z = canvas.getZoom();
+      const pointer = canvas.getPointer(opt.e);
+      const zoom = canvas.getZoom();
       const vpt = canvas.viewportTransform;
-      const px = Math.round(pointer.x * z + vpt[4]);
-      const py = Math.round(pointer.y * z + vpt[5]);
-      const pixel = ctx.getImageData(px, py, 1, 1).data;
-      const hex = `#${pixel[0].toString(16).padStart(2, '0')}${pixel[1].toString(16).padStart(2, '0')}${pixel[2].toString(16).padStart(2, '0')}`;
-      useEditorStore.getState().setColor(hex);
+      // Convert canvas coordinates to screen pixel coordinates
+      const px = Math.round(pointer.x * zoom + vpt[4]);
+      const py = Math.round(pointer.y * zoom + vpt[5]);
+      try {
+        const pixel = ctx.getImageData(px, py, 1, 1).data;
+        const hex = '#' +
+          pixel[0].toString(16).padStart(2, '0') +
+          pixel[1].toString(16).padStart(2, '0') +
+          pixel[2].toString(16).padStart(2, '0');
+        useEditorStore.getState().setColor(hex);
+        useEditorStore.getState().updateBrush({ color: hex });
+      } catch {
+        // cross-origin pixel read may fail
+      }
       setActiveTool('select');
     });
   }
@@ -734,7 +888,7 @@ export default function Canvas() {
           top: pointer.y,
           fontFamily: ts.fontFamily,
           fontSize: ts.fontSize,
-          fontWeight: ts.fontWeight,
+          fontWeight: String(ts.fontWeight),
           fontStyle: ts.fontStyle,
           textAlign: ts.textAlign,
           fill: ts.color,
@@ -753,7 +907,7 @@ export default function Canvas() {
           textStyle: {
             fontFamily: ts.fontFamily,
             fontSize: ts.fontSize,
-            fontWeight: ts.fontWeight,
+            fontWeight: ts.fontWeight as number,
             fontStyle: ts.fontStyle,
             textDecoration: '',
             textAlign: ts.textAlign,
@@ -792,8 +946,9 @@ export default function Canvas() {
         const commonProps = {
           left: pointer.x, top: pointer.y,
           fill: settings.fillColor,
-          stroke: settings.strokeWidth > 0 ? settings.strokeColor : undefined,
+          stroke: settings.strokeWidth > 0 ? settings.strokeColor : null,
           strokeWidth: settings.strokeWidth,
+          strokeUniform: true,
           selectable: false,
           evented: false,
         };
@@ -851,6 +1006,18 @@ export default function Canvas() {
       if (!isDrawingRef.current || !activeShape) return;
       isDrawingRef.current = false;
       const settings = useEditorStore.getState().shapeSettings;
+      const w = Math.round(
+        settings.shapeType === 'circle'
+          ? (activeShape.rx ?? 1) * 2
+          : settings.shapeType === 'line' || settings.shapeType === 'arrow'
+            ? Math.abs((activeShape.x2 ?? 0) - (activeShape.x1 ?? 0))
+            : activeShape.width ?? 1
+      );
+      const h = Math.round(
+        settings.shapeType === 'circle'
+          ? (activeShape.ry ?? 1) * 2
+          : activeShape.height ?? 1
+      );
       const layer = createLayer({
         type: 'shape',
         name: settings.shapeType === 'rect' ? 'Прямоугольник' :
@@ -858,12 +1025,12 @@ export default function Canvas() {
               settings.shapeType === 'line' ? 'Линия' : 'Фигура',
         shapeType: settings.shapeType,
         fillColor: settings.fillColor,
-        strokeColor: settings.strokeColor,
+        strokeColor: settings.strokeWidth > 0 ? settings.strokeColor : undefined,
         strokeWidth: settings.strokeWidth,
         x: Math.round(activeShape.left ?? 0),
         y: Math.round(activeShape.top ?? 0),
-        width: Math.round(activeShape.width ?? 1),
-        height: Math.round(activeShape.height ?? 1),
+        width: Math.max(w, 1),
+        height: Math.max(h, 1),
       });
       activeShape.set({ selectable: true, evented: true, data: { layerId: layer.id } });
       canvas.setActiveObject(activeShape);
@@ -871,6 +1038,214 @@ export default function Canvas() {
       prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
       pushHistory(`Добавить: ${layer.name}`);
       activeShape = null;
+      startPoint = null;
+      setActiveTool('select');
+    });
+  }
+
+  function setupLassoTool(canvas: any) {
+    let points: { x: number; y: number }[] = [];
+    let polygon: any = null;
+    let isDown = false;
+
+    canvas.on('mouse:down', (opt: any) => {
+      isDown = true;
+      points = [];
+      const pointer = canvas.getPointer(opt.e);
+      points.push(pointer);
+    });
+
+    canvas.on('mouse:move', (opt: any) => {
+      if (!isDown) return;
+      const pointer = canvas.getPointer(opt.e);
+      points.push(pointer);
+
+      if (polygon) canvas.remove(polygon);
+      if (points.length < 2) return;
+
+      (async () => {
+        const fb = await getFabric();
+        polygon = new fb.Polyline(points, {
+          stroke: '#4d9bff',
+          strokeWidth: 1,
+          fill: 'rgba(77,155,255,0.15)',
+          selectable: false,
+          evented: false,
+          strokeDashArray: [4, 4],
+        });
+        canvas.add(polygon);
+        canvas.requestRenderAll();
+      })();
+    });
+
+    canvas.on('mouse:up', () => {
+      isDown = false;
+      if (polygon) canvas.remove(polygon);
+      polygon = null;
+      points = [];
+      setActiveTool('select');
+    });
+  }
+
+  function setupCropTool(canvas: any) {
+    let startPoint: { x: number; y: number } | null = null;
+    let cropRect: any = null;
+
+    canvas.on('mouse:down', (opt: any) => {
+      if (cropRect) { canvas.remove(cropRect); cropRect = null; }
+      const pointer = canvas.getPointer(opt.e);
+      startPoint = pointer;
+
+      (async () => {
+        const fb = await getFabric();
+        cropRect = new fb.Rect({
+          left: pointer.x, top: pointer.y,
+          width: 1, height: 1,
+          stroke: '#ffffff',
+          strokeWidth: 1,
+          strokeDashArray: [5, 5],
+          fill: 'rgba(255,255,255,0.05)',
+          selectable: false,
+          evented: false,
+        });
+        canvas.add(cropRect);
+      })();
+    });
+
+    canvas.on('mouse:move', (opt: any) => {
+      if (!startPoint || !cropRect) return;
+      const pointer = canvas.getPointer(opt.e);
+      const w = pointer.x - startPoint.x;
+      const h = pointer.y - startPoint.y;
+      cropRect.set({
+        left: w < 0 ? pointer.x : startPoint.x,
+        top: h < 0 ? pointer.y : startPoint.y,
+        width: Math.abs(w),
+        height: Math.abs(h),
+      });
+      canvas.requestRenderAll();
+    });
+
+    canvas.on('mouse:up', () => {
+      if (cropRect) {
+        // Apply crop to canvas background
+        const bounds = {
+          x: Math.round(cropRect.left ?? 0),
+          y: Math.round(cropRect.top ?? 0),
+          width: Math.round(cropRect.width ?? 0),
+          height: Math.round(cropRect.height ?? 0),
+        };
+        if (bounds.width > 10 && bounds.height > 10) {
+          useProjectStore.getState().setCanvasSize({ width: bounds.width, height: bounds.height });
+        }
+        canvas.remove(cropRect);
+        cropRect = null;
+      }
+      startPoint = null;
+      setActiveTool('select');
+    });
+  }
+
+  function setupCloneTool(canvas: any) {
+    canvas.on('mouse:down', (opt: any) => {
+      const pointer = canvas.getPointer(opt.e);
+      if (opt.e.altKey) {
+        // Alt+click sets source
+        cloneSourceRef.current = { x: pointer.x, y: pointer.y };
+        // Capture canvas pixel data at source
+        const el: HTMLCanvasElement = (canvas as any).getElement?.() ?? canvasRef.current;
+        const ctx = el?.getContext('2d');
+        if (ctx) {
+          const zoom = canvas.getZoom();
+          const vpt = canvas.viewportTransform;
+          const px = Math.round(pointer.x * zoom + vpt[4]);
+          const py = Math.round(pointer.y * zoom + vpt[5]);
+          const size = useEditorStore.getState().cloneSettings.size;
+          try {
+            cloneImageDataRef.current = ctx.getImageData(px - size / 2, py - size / 2, size, size);
+          } catch { /* ignore cross-origin */ }
+        }
+        return;
+      }
+
+      if (!cloneSourceRef.current) return;
+
+      // Draw clone brush stroke at destination
+      (async () => {
+        const fb = await getFabric();
+        const settings = useEditorStore.getState().cloneSettings;
+        // Draw a circle at destination as clone indicator
+        const circle = new fb.Circle({
+          left: pointer.x - settings.size / 2,
+          top: pointer.y - settings.size / 2,
+          radius: settings.size / 2,
+          fill: 'rgba(100,200,255,0.4)',
+          stroke: '#4d9bff',
+          strokeWidth: 1,
+          selectable: false,
+          evented: false,
+        });
+        canvas.add(circle);
+        canvas.requestRenderAll();
+        setTimeout(() => { canvas.remove(circle); canvas.requestRenderAll(); }, 300);
+      })();
+    });
+  }
+
+  function setupGradientTool(canvas: any) {
+    let startPoint: { x: number; y: number } | null = null;
+
+    canvas.on('mouse:down', (opt: any) => {
+      startPoint = canvas.getPointer(opt.e);
+    });
+
+    canvas.on('mouse:up', (opt: any) => {
+      if (!startPoint) return;
+      const endPoint = canvas.getPointer(opt.e);
+      const activeObj = canvas.getActiveObject() as any;
+
+      if (activeObj) {
+        (async () => {
+          const fb = await getFabric();
+          const w = activeObj.width ?? 100;
+          const h = activeObj.height ?? 100;
+          const primaryColor = useEditorStore.getState().activeColor;
+          const secondaryColor = useEditorStore.getState().secondaryColor;
+
+          const gradient = new fb.Gradient({
+            type: 'linear',
+            gradientUnits: 'percentage',
+            coords: {
+              x1: (startPoint!.x - (activeObj.left ?? 0)) / w,
+              y1: (startPoint!.y - (activeObj.top ?? 0)) / h,
+              x2: (endPoint.x - (activeObj.left ?? 0)) / w,
+              y2: (endPoint.y - (activeObj.top ?? 0)) / h,
+            },
+            colorStops: [
+              { offset: 0, color: primaryColor },
+              { offset: 1, color: secondaryColor },
+            ],
+          });
+          activeObj.set('fill', gradient);
+          canvas.requestRenderAll();
+
+          // Update layer in store
+          const layerId = activeObj.data?.layerId;
+          if (layerId) {
+            useProjectStore.getState().updateLayer(layerId, {
+              gradient: {
+                type: 'linear',
+                angle: 0,
+                stops: [
+                  { id: '1', offset: 0, color: primaryColor, opacity: 1 },
+                  { id: '2', offset: 1, color: secondaryColor, opacity: 1 },
+                ],
+              },
+            });
+          }
+        })();
+      }
+
       startPoint = null;
       setActiveTool('select');
     });
@@ -935,6 +1310,9 @@ function getCursor(tool: ToolType): string {
     case 'brush': return 'crosshair';
     case 'eraser': return 'cell';
     case 'shape': return 'crosshair';
+    case 'lasso': return 'crosshair';
+    case 'gradient': return 'crosshair';
+    case 'clone': return 'copy';
     default: return 'default';
   }
 }
