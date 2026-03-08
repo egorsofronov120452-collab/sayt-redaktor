@@ -147,8 +147,8 @@ export default function MenuBar() {
         { separator: true },
         { label: 'Сохранить проект', icon: <Save size={12} />, shortcut: 'Ctrl+S', onClick: () => alert('Сохранение в IndexedDB — скоро') },
         { separator: true },
-        { label: 'Экспорт изображения...', icon: <ImageIcon size={12} />, onClick: () => alert('Экспорт через панель Export') },
-        { label: 'Экспорт видео...', icon: <Film size={12} />, onClick: () => alert('Экспорт через панель Export') },
+        { label: 'Экспорт изображения...', icon: <ImageIcon size={12} />, shortcut: 'Ctrl+E', onClick: () => window.dispatchEvent(new CustomEvent('open-export')) },
+        { label: 'Экспорт видео...', icon: <Film size={12} />, onClick: () => window.dispatchEvent(new CustomEvent('open-export')) },
       ] as MenuItemDef[],
     },
     {

@@ -119,7 +119,7 @@ export default function Home() {
 
   return (
     <div
-      className="min-h-screen bg-[#141418] flex flex-col items-center justify-center p-8 font-sans"
+      className="min-h-screen bg-[#141418] flex flex-col items-center justify-center p-8 font-sans overflow-y-auto"
       onDragOver={handlePageDragOver}
       onDragLeave={handlePageDragLeave}
       onDrop={handlePageDrop}

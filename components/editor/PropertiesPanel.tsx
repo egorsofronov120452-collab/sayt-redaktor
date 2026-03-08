@@ -9,8 +9,9 @@ import { cn } from '@/lib/utils';
 import {
   ChevronDown, ChevronRight, Wand2, RotateCw, FlipHorizontal, FlipVertical,
   SunMedium, Contrast, Droplets, Wind, Zap, Mountain, AlignLeft, AlignCenter,
-  AlignRight, Bold, Italic, Underline,
+  AlignRight, Bold, Italic, Underline, Plus, Trash2,
 } from 'lucide-react';
+import { nanoid } from 'nanoid';
 
 // ---- Reusable UI pieces ----
 
@@ -347,6 +348,80 @@ function ShapeSection({ layer, update }: { layer: Layer; update: (p: Partial<Lay
   );
 }
 
+// ---- Gradient editor ----
+function GradientSection({ layer, update }: { layer: Layer; update: (p: Partial<Layer>) => void }) {
+  const g = layer.gradient ?? {
+    type: 'linear' as const,
+    angle: 0,
+    stops: [
+      { id: nanoid(), offset: 0, color: '#4d9bff', opacity: 1 },
+      { id: nanoid(), offset: 1, color: '#000000', opacity: 1 },
+    ],
+  };
+
+  const setGradient = (patch: Partial<typeof g>) =>
+    update({ gradient: { ...g, ...patch } });
+
+  const setStop = (id: string, patch: Partial<(typeof g.stops)[0]>) =>
+    setGradient({ stops: g.stops.map((s) => s.id === id ? { ...s, ...patch } : s) });
+
+  const addStop = () =>
+    setGradient({ stops: [...g.stops, { id: nanoid(), offset: 0.5, color: '#ffffff', opacity: 1 }] });
+
+  const removeStop = (id: string) =>
+    setGradient({ stops: g.stops.filter((s) => s.id !== id) });
+
+  return (
+    <PanelSection title="Градиент" defaultOpen={false}>
+      <PropRow label="Тип">
+        <div className="flex gap-1">
+          {(['linear', 'radial'] as const).map((t) => (
+            <button key={t} onClick={() => setGradient({ type: t })}
+              className={`flex-1 text-[10px] py-0.5 rounded border transition-colors ${g.type === t ? 'border-primary bg-primary/20 text-primary' : 'border-border text-muted-foreground hover:text-foreground'}`}>
+              {t === 'linear' ? 'Линейный' : 'Радиальный'}
+            </button>
+          ))}
+        </div>
+      </PropRow>
+      {g.type === 'linear' && (
+        <SliderRow label="Угол" value={g.angle} onChange={(v) => setGradient({ angle: v })} min={0} max={360} unit="°" />
+      )}
+      <div className="mt-1.5 space-y-1">
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-[10px] text-muted-foreground">Точки градиента</span>
+          <button onClick={addStop} className="w-5 h-5 flex items-center justify-center rounded hover:bg-white/10 text-muted-foreground hover:text-primary">
+            <Plus size={11} />
+          </button>
+        </div>
+        {/* Preview bar */}
+        <div className="h-4 rounded-sm w-full" style={{
+          background: `linear-gradient(90deg, ${[...g.stops].sort((a, b) => a.offset - b.offset).map((s) => `${s.color} ${s.offset * 100}%`).join(', ')})`,
+        }} />
+        {g.stops.map((stop) => (
+          <div key={stop.id} className="flex items-center gap-1.5">
+            <label className="relative cursor-pointer">
+              <div className="w-5 h-5 rounded-sm border border-border" style={{ backgroundColor: stop.color }} />
+              <input type="color" value={stop.color} onChange={(e) => setStop(stop.id, { color: e.target.value })} className="sr-only" />
+            </label>
+            <input
+              type="range" min={0} max={100} value={Math.round(stop.offset * 100)}
+              onChange={(e) => setStop(stop.id, { offset: +e.target.value / 100 })}
+              className="flex-1 accent-primary h-1"
+            />
+            <span className="text-[10px] font-mono text-muted-foreground w-6 text-right">{Math.round(stop.offset * 100)}%</span>
+            <SliderRow label="A" value={Math.round(stop.opacity * 100)} onChange={(v) => setStop(stop.id, { opacity: v / 100 })} min={0} max={100} unit="%" />
+            {g.stops.length > 2 && (
+              <button onClick={() => removeStop(stop.id)} className="w-5 h-5 flex items-center justify-center text-muted-foreground hover:text-destructive">
+                <Trash2 size={10} />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    </PanelSection>
+  );
+}
+
 // ---- Blur tool properties ----
 function BlurSection({ layer, update }: { layer: Layer; update: (p: Partial<Layer>) => void }) {
   const blur = layer.effects.blur;
@@ -416,6 +491,9 @@ export default function PropertiesPanel() {
       {/* Type-specific */}
       {layer.type === 'text' && <TextSection layer={layer} update={update} />}
       {layer.type === 'shape' && <ShapeSection layer={layer} update={update} />}
+      {(layer.type === 'shape' || layer.type === 'image' || layer.type === 'gradient') && (
+        <GradientSection layer={layer} update={update} />
+      )}
       {layer.adjustments && <AdjustmentsSection layer={layer} update={update} />}
       <EffectsSection layer={layer} update={update} />
       <BlurSection layer={layer} update={update} />

@@ -298,13 +298,44 @@ export default function Timeline() {
   const goToStart = () => { setCurrentTime(0); setPlaying(false); };
   const goToEnd = () => { setCurrentTime(duration); setPlaying(false); };
 
-  // Playhead drag
-  const handleRulerClick = (e: React.MouseEvent) => {
-    const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
-    const x = e.clientX - rect.left - offsetX;
-    const time = Math.max(0, Math.min(duration, Math.round(x / scale)));
+  // Playhead drag / scrub
+  const isScrubbing = useRef(false);
+
+  const getTimeFromEvent = (e: React.MouseEvent | MouseEvent, el: HTMLElement) => {
+    const rect = el.getBoundingClientRect();
+    const x = e.clientX - rect.left - HEADER_WIDTH - offsetX;
+    return Math.max(0, Math.min(duration, Math.round(x / scale)));
+  };
+
+  const handleRulerMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    isScrubbing.current = true;
+    const time = getTimeFromEvent(e, e.currentTarget);
     setCurrentTime(time);
   };
+
+  const handleRulerClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const time = getTimeFromEvent(e, e.currentTarget);
+    setCurrentTime(time);
+  };
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isScrubbing.current || !timelineRef.current) return;
+      const ruler = timelineRef.current.parentElement?.querySelector('.ruler-area') as HTMLElement;
+      if (!ruler) return;
+      const x = e.clientX - ruler.getBoundingClientRect().left - HEADER_WIDTH - offsetX;
+      const time = Math.max(0, Math.min(duration, Math.round(x / scale)));
+      setCurrentTime(time);
+    };
+    const onMouseUp = () => { isScrubbing.current = false; };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [duration, scale, offsetX]);
 
   // Keyframe management
   const handleAddKeyframe = useCallback((layerId: string, prop: string, time: number) => {
@@ -423,13 +454,7 @@ export default function Timeline() {
       {/* Main timeline area */}
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Ruler */}
-        <div className="relative cursor-pointer shrink-0" onClick={handleRulerClick}>
-          <div
-            className="absolute top-0 flex items-stretch"
-            style={{ left: HEADER_WIDTH, width: visibleDuration * scale + 100 }}
-          >
-            {/* ruler ticks rendered inline */}
-          </div>
+        <div className="ruler-area relative cursor-col-resize shrink-0" onMouseDown={handleRulerMouseDown} onClick={handleRulerClick}>
           <Ruler duration={duration} scale={scale} offsetX={offsetX} />
         </div>
 

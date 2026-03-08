@@ -119,7 +119,15 @@ const TOOL_GROUPS: { label: string; tools: ToolDef[] }[] = [
 ];
 
 export default function Toolbar() {
-  const { activeTool, setActiveTool, activeColor, secondaryColor, swapColors } = useEditorStore();
+  const { activeTool, setActiveTool, activeColor, secondaryColor, swapColors, brushSettings, updateBrush } = useEditorStore();
+
+  // When brush/eraser is active, keep toolbar swatch and brushSettings.color in sync
+  const handlePrimaryColorChange = (color: string) => {
+    useEditorStore.getState().setColor(color);
+    if (activeTool === 'brush') {
+      updateBrush({ color });
+    }
+  };
 
   const handleKey = (e: KeyboardEvent) => {
     if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
@@ -163,7 +171,7 @@ export default function Toolbar() {
           {/* Primary color (foreground) */}
           <div
             className="absolute top-0 left-0 w-5 h-5 rounded-sm border-2 border-panel-border"
-            style={{ backgroundColor: activeColor }}
+            style={{ backgroundColor: activeTool === 'brush' ? brushSettings.color : activeColor }}
             onClick={() => {
               const el = document.getElementById('primary-color-input');
               el?.click();
@@ -178,8 +186,10 @@ export default function Toolbar() {
           >
             ⇄
           </button>
-          <input id="primary-color-input" type="color" value={activeColor} className="sr-only"
-            onChange={(e) => useEditorStore.getState().setColor(e.target.value)} />
+          <input id="primary-color-input" type="color"
+            value={activeTool === 'brush' ? brushSettings.color : activeColor}
+            className="sr-only"
+            onChange={(e) => handlePrimaryColorChange(e.target.value)} />
           <input id="secondary-color-input" type="color" value={secondaryColor} className="sr-only"
             onChange={(e) => useEditorStore.getState().setColor(useEditorStore.getState().activeColor, e.target.value)} />
         </div>

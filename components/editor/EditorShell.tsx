@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import { useProjectStore } from '@/store/projectStore';
 import { useEditorStore } from '@/store/editorStore';
+import { getCanvasInstance } from '@/components/editor/Canvas';
 import MenuBar from './MenuBar';
 import Toolbar from './Toolbar';
 import LayersPanel from './LayersPanel';
@@ -92,8 +93,43 @@ function ExportDialog({ onClose }: { onClose: () => void }) {
   const isVideo = ['mp4', 'webm', 'gif'].includes(exportSettings.format);
 
   const handleExport = () => {
-    // Stub: in production this would use canvas.toDataURL() or ffmpeg.wasm
-    alert(`Экспорт в ${exportSettings.format.toUpperCase()} (${exportSettings.width}×${exportSettings.height}) запущен.\n\nВ полной версии здесь будет обработка через Canvas API / FFmpeg.wasm.`);
+    const canvas = getCanvasInstance() as any;
+    if (!canvas) {
+      alert('Холст ещё не инициализирован');
+      return;
+    }
+
+    if (isVideo) {
+      alert('Экспорт видео требует FFmpeg.wasm — функция будет добавлена в следующей версии.');
+      return;
+    }
+
+    const mimeType = exportSettings.format === 'jpeg' ? 'image/jpeg' : 'image/png';
+    const ext = exportSettings.format === 'jpeg' ? 'jpg' : 'png';
+
+    // Scale multiplier so output matches requested resolution
+    const multiplier = exportSettings.width / project.canvas.width;
+
+    let dataUrl: string;
+    try {
+      dataUrl = canvas.toDataURL({
+        format: exportSettings.format === 'jpeg' ? 'jpeg' : 'png',
+        quality: exportSettings.quality / 100,
+        multiplier,
+        ...(exportSettings.transparent && exportSettings.format === 'png' ? { enableRetinaScaling: false } : {}),
+      });
+    } catch (err) {
+      console.error('[v0] export error', err);
+      alert('Ошибка экспорта: ' + (err as any)?.message);
+      return;
+    }
+
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = `${project.name ?? 'export'}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     onClose();
   };
 
@@ -266,8 +302,13 @@ export default function EditorShell() {
       // Ctrl+E = export
       if (e.ctrlKey && e.key === 'e') { e.preventDefault(); setShowExport(true); }
     };
+    const openExportHandler = () => setShowExport(true);
     window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
+    window.addEventListener('open-export', openExportHandler);
+    return () => {
+      window.removeEventListener('keydown', handler);
+      window.removeEventListener('open-export', openExportHandler);
+    };
   }, []);
 
   const handleRightDrag = useCallback((delta: number) => {
