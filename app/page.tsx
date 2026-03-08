@@ -88,15 +88,34 @@ export default function Home() {
     setSavedProjects(loadSavedProjects());
   }, []);
 
+  // Toggle body class for overflow control: editor needs overflow:hidden, start page needs scroll
+  useEffect(() => {
+    if (editorOpen) {
+      document.body.classList.add('editor-open');
+    } else {
+      document.body.classList.remove('editor-open');
+    }
+    return () => { document.body.classList.remove('editor-open'); };
+  }, [editorOpen]);
+
   // Auto-save whenever project changes (after mount)
   useEffect(() => {
-    if (!mounted || !project.layers.length) return;
+    if (!mounted) return;
+    // Refresh saved projects list from localStorage to stay in sync
+    setSavedProjects(loadSavedProjects());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mounted]);
+
+  // Save to localStorage on every project change
+  useEffect(() => {
+    if (!mounted) return;
     saveProjectToList(
       { id: project.id, name: project.name, updatedAt: project.updatedAt, canvas: project.canvas },
       useProjectStore.getState().project
     );
+    setSavedProjects(loadSavedProjects());
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.updatedAt]);
+  }, [project.updatedAt, project.id]);
 
   const openWithPreset = (preset: typeof CANVAS_PRESETS[0]) => {
     newProject({ width: preset.width, height: preset.height, name: preset.name });
@@ -182,8 +201,8 @@ export default function Home() {
 
   return (
     <div
-      className="min-h-screen bg-[#141418] flex flex-col items-center py-10 px-8 font-sans"
-      style={{ overflowY: 'auto' }}
+      className="bg-[#141418] flex flex-col items-center py-10 px-8 font-sans"
+      style={{ minHeight: '100vh', overflowY: 'auto', overflowX: 'hidden' }}
       onDragOver={handlePageDragOver}
       onDragLeave={handlePageDragLeave}
       onDrop={handlePageDrop}
@@ -322,7 +341,7 @@ export default function Home() {
               <Clock size={14} className="text-[#4d9bff]" />
               <span className="text-sm font-semibold text-white">Сохранённые проекты</span>
             </div>
-            <div className="p-2 overflow-y-auto max-h-60">
+            <div className="p-2 overflow-y-auto" style={{ maxHeight: '60vh' }}>
               {!mounted ? null : savedProjects.length === 0 ? (
                 <div className="px-2 py-4 text-center text-[11px] text-white/30">
                   Нет сохранённых проектов
