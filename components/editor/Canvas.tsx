@@ -133,8 +133,6 @@ export default function Canvas() {
       const brush = new fb.PencilBrush(canvas);
       brush.color = brushSettings.color;
       brush.width = brushSettings.size;
-      (brush as any).strokeLineCap = 'round';
-      (brush as any).strokeLineJoin = 'round';
       canvas.freeDrawingBrush = brush;
 
       fabricRef.current = canvas as unknown as FabricCanvas;
@@ -257,14 +255,20 @@ export default function Canvas() {
           return;
         }
 
-        // Brush stroke: keep stroke color, set fill to null
+        // Brush stroke: transparent fill, colored stroke with round caps
+        const bs = useEditorStore.getState().brushSettings;
+        const hex6 = bs.color.replace('#', '').padStart(6, '0');
+        const r = parseInt(hex6.substring(0, 2), 16);
+        const g = parseInt(hex6.substring(2, 4), 16);
+        const b = parseInt(hex6.substring(4, 6), 16);
+        const strokeColor = `rgba(${r},${g},${b},${bs.opacity})`;
         path.set({
-          fill: null,
-          stroke: brushSettings.color,
-          strokeWidth: brushSettings.size,
+          fill: 'transparent',
+          stroke: strokeColor,
+          strokeWidth: bs.size,
           strokeLineCap: 'round',
           strokeLineJoin: 'round',
-          opacity: brushSettings.opacity,
+          opacity: 1,
           selectable: true,
           evented: true,
           data: { layerId: '', isBrushStroke: true },
@@ -430,7 +434,7 @@ export default function Canvas() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.layers]);
 
-  // Update canvas background color and size when project.canvas changes
+  // Update canvas background color when changed
   useEffect(() => {
     const canvas = fabricRef.current as any;
     if (!canvas) return;
@@ -441,24 +445,37 @@ export default function Canvas() {
     }
   }, [project.backgroundColor]);
 
-  // Fit canvas to container
+  // Update Fabric canvas dimensions when project.canvas size changes
+  useEffect(() => {
+    const canvas = fabricRef.current as any;
+    if (!canvas) return;
+    const { width, height } = project.canvas;
+    if (canvas._fw === width && canvas._fh === height) return;
+    canvas._fw = width;
+    canvas._fh = height;
+    // Re-fit: update the internal canvas size and refit to container
+    fitCanvasToContainer(canvas, containerRef.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.canvas.width, project.canvas.height]);
+
+  // Fit canvas to container (also updates Fabric's internal canvas size)
   const fitCanvasToContainer = useCallback((canvas: any, container: HTMLDivElement | null) => {
     if (!container) return;
-    const cw = container.clientWidth;
-    const ch = container.clientHeight;
-    const scaleX = cw / project.canvas.width;
-    const scaleY = ch / project.canvas.height;
+    const { width: pw, height: ph } = useProjectStore.getState().project.canvas;
+    const cw = container.clientWidth || pw;
+    const ch = container.clientHeight || ph;
+    const scaleX = cw / pw;
+    const scaleY = ch / ph;
     const scale = Math.min(scaleX, scaleY) * 0.85;
-    canvas.setZoom(scale);
     canvas.setWidth(cw);
     canvas.setHeight(ch);
-    const vpX = (cw - project.canvas.width * scale) / 2;
-    const vpY = (ch - project.canvas.height * scale) / 2;
+    const vpX = (cw - pw * scale) / 2;
+    const vpY = (ch - ph * scale) / 2;
     canvas.viewportTransform = [scale, 0, 0, scale, vpX, vpY];
     canvas.requestRenderAll();
     setZoom(scale);
     setPan(vpX, vpY);
-  }, [project.canvas.width, project.canvas.height, setZoom, setPan]);
+  }, [setZoom, setPan]);
 
   // Animation playback RAF loop
   useEffect(() => {
@@ -567,17 +584,13 @@ export default function Canvas() {
         (async () => {
           const fb = await getFabric();
           const brush = new fb.PencilBrush(canvas);
-          brush.color = brushSettings.color;
-          brush.width = brushSettings.size;
-          (brush as any).strokeLineCap = 'round';
-          (brush as any).strokeLineJoin = 'round';
-          (brush as any).globalCompositeOperation = 'source-over';
-          // Apply opacity through the color alpha channel
-          const hex = brushSettings.color.replace('#', '');
+          const hex = brushSettings.color.replace('#', '').padStart(6, '0');
           const r = parseInt(hex.substring(0, 2), 16);
           const g = parseInt(hex.substring(2, 4), 16);
           const b = parseInt(hex.substring(4, 6), 16);
           brush.color = `rgba(${r},${g},${b},${brushSettings.opacity})`;
+          brush.width = brushSettings.size;
+          // Set fill to transparent via decorate after path is created (handled in path:created)
           canvas.freeDrawingBrush = brush;
         })();
         break;
@@ -769,16 +782,24 @@ export default function Canvas() {
     }
 
     if (layer.type === 'video' && layer.src) {
+      // Blob URLs become stale after page reload — skip them silently
+      if (layer.src.startsWith('blob:')) {
+        // Try to verify the blob URL is still valid
+        const isAlive = await fetch(layer.src, { method: 'HEAD' }).then(() => true).catch(() => false);
+        if (!isAlive) return;
+      }
+
       let videoEl = videoElemsRef.current.get(layer.id);
       if (!videoEl) {
         videoEl = document.createElement('video');
-        // Don't set crossOrigin for blob URLs — they don't support CORS
         const isBlobUrl = layer.src.startsWith('blob:');
         if (!isBlobUrl) videoEl.crossOrigin = 'anonymous';
         videoEl.src = layer.src;
         videoEl.loop = true;
         videoEl.muted = true;
         videoEl.playsInline = true;
+        videoEl.preload = 'auto';
+        videoEl.load();
         videoElemsRef.current.set(layer.id, videoEl);
       }
 
@@ -787,7 +808,7 @@ export default function Canvas() {
         videoEl!.oncanplay = () => res();
         videoEl!.onloadeddata = () => res();
         videoEl!.onerror = () => res();
-        setTimeout(res, 5000);
+        setTimeout(res, 8000);
       });
 
       const vw = videoEl.videoWidth || layer.width || 1280;
@@ -828,8 +849,14 @@ export default function Canvas() {
       canvas.requestRenderAll();
 
       const vidDurationMs = (videoEl.duration && isFinite(videoEl.duration)) ? videoEl.duration * 1000 : 0;
-      if (vidDurationMs > 0 && vidDurationMs > useProjectStore.getState().project.duration) {
-        useProjectStore.getState().setDuration(Math.ceil(vidDurationMs));
+      if (vidDurationMs > 0) {
+        // Always set duration to the video's real duration
+        const currentDuration = useProjectStore.getState().project.duration;
+        if (vidDurationMs > currentDuration) {
+          useProjectStore.getState().setDuration(Math.ceil(vidDurationMs));
+        }
+        // Also update the layer's videoEnd to the real duration
+        useProjectStore.getState().updateLayer(layer.id, { videoEnd: Math.ceil(vidDurationMs) });
       }
       return;
     }
@@ -1041,33 +1068,33 @@ export default function Canvas() {
 
   // ─── Tool setups ────────────────────────────────────────────────────────────
 
-  function setupEraserTool(canvas: any) {
-    // Get the raw 2D canvas context and paint with destination-out
-    const rawEl: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
+  // Get the lower canvas element (actual drawing surface in Fabric.js)
+  function getLowerCanvas(canvas: any): HTMLCanvasElement | null {
+    // Fabric keeps the actual drawing canvas as lowerCanvasEl
+    return canvas.lowerCanvasEl ?? canvas.getElement?.() ?? canvasRef.current;
+  }
 
-    const getCanvasPoint = (e: MouseEvent | TouchEvent) => {
-      const el: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
-      if (!el) return { x: 0, y: 0 };
-      const rect = el.getBoundingClientRect();
-      const clientX = 'touches' in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
-      const clientY = 'touches' in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
-      const x = (clientX - rect.left);
-      const y = (clientY - rect.top);
-      return { x, y };
-    };
+  // Convert a DOM mouse event to canvas-space coordinates (accounting for zoom/pan)
+  function domToCanvasCoords(canvas: any, e: MouseEvent): { x: number; y: number } {
+    const pointer = canvas.getPointer(e, true); // true = ignore transform, gives raw canvas px
+    return { x: pointer.x, y: pointer.y };
+  }
+
+  function setupEraserTool(canvas: any) {
+    const getPoint = (opt: any) => domToCanvasCoords(canvas, opt.e);
 
     canvas.on('mouse:down', (opt: any) => {
       isDrawingRef.current = true;
-      const pt = getCanvasPoint(opt.e);
+      const pt = getPoint(opt);
       eraserLastPosRef.current = pt;
-      eraserPaintAt(canvas, rawEl, pt.x, pt.y, pt.x, pt.y);
+      eraserPaintAt(canvas, pt.x, pt.y, pt.x, pt.y);
     });
 
     canvas.on('mouse:move', (opt: any) => {
       if (!isDrawingRef.current) return;
-      const pt = getCanvasPoint(opt.e);
+      const pt = getPoint(opt);
       const last = eraserLastPosRef.current ?? pt;
-      eraserPaintAt(canvas, rawEl, last.x, last.y, pt.x, pt.y);
+      eraserPaintAt(canvas, last.x, last.y, pt.x, pt.y);
       eraserLastPosRef.current = pt;
     });
 
@@ -1077,46 +1104,46 @@ export default function Canvas() {
     });
   }
 
-  function eraserPaintAt(canvas: any, rawEl: HTMLCanvasElement, x1: number, y1: number, x2: number, y2: number) {
-    if (!rawEl) return;
-    const ctx = rawEl.getContext('2d');
+  function eraserPaintAt(canvas: any, x1: number, y1: number, x2: number, y2: number) {
+    const lowerEl = getLowerCanvas(canvas);
+    if (!lowerEl) return;
+    const ctx = lowerEl.getContext('2d');
     if (!ctx) return;
     const { eraserSettings: es } = useEditorStore.getState();
+    const vpt = canvas.viewportTransform as number[];
+    const zoom = vpt ? vpt[0] : 1;
+    // Convert from viewport coords to canvas coords
+    const cx1 = vpt ? x1 * zoom + vpt[4] : x1;
+    const cy1 = vpt ? y1 * zoom + vpt[5] : y1;
+    const cx2 = vpt ? x2 * zoom + vpt[4] : x2;
+    const cy2 = vpt ? y2 * zoom + vpt[5] : y2;
     ctx.save();
     ctx.globalCompositeOperation = 'destination-out';
     ctx.strokeStyle = `rgba(0,0,0,${es.opacity})`;
-    ctx.lineWidth = es.size;
+    ctx.lineWidth = es.size * zoom;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
+    ctx.moveTo(cx1, cy1);
+    ctx.lineTo(cx2, cy2);
     ctx.stroke();
     ctx.restore();
-    // Don't call requestRenderAll — that would re-draw fabric objects over our erased content
   }
 
   function setupBlurBrushTool(canvas: any) {
-    const rawEl: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
-
-    const getCanvasPoint = (e: MouseEvent) => {
-      const el: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
-      if (!el) return { x: 0, y: 0 };
-      const rect = el.getBoundingClientRect();
-      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
-    };
+    const getPoint = (opt: any) => domToCanvasCoords(canvas, opt.e);
 
     canvas.on('mouse:down', (opt: any) => {
       isDrawingRef.current = true;
-      const pt = getCanvasPoint(opt.e);
+      const pt = getPoint(opt);
       blurLastPosRef.current = pt;
-      blurPaintAt(rawEl, pt.x, pt.y);
+      blurPaintAt(canvas, pt.x, pt.y);
     });
 
     canvas.on('mouse:move', (opt: any) => {
       if (!isDrawingRef.current) return;
-      const pt = getCanvasPoint(opt.e);
-      blurPaintAt(rawEl, pt.x, pt.y);
+      const pt = getPoint(opt);
+      blurPaintAt(canvas, pt.x, pt.y);
       blurLastPosRef.current = pt;
     });
 
@@ -1126,22 +1153,29 @@ export default function Canvas() {
     });
   }
 
-  function blurPaintAt(rawEl: HTMLCanvasElement, x: number, y: number) {
-    if (!rawEl) return;
-    const ctx = rawEl.getContext('2d');
+  function blurPaintAt(canvas: any, x: number, y: number) {
+    const lowerEl = getLowerCanvas(canvas);
+    if (!lowerEl) return;
+    const ctx = lowerEl.getContext('2d');
     if (!ctx) return;
     const { blurToolSettings: bts } = useEditorStore.getState();
-    const radius = bts.radius;
+    const vpt = canvas.viewportTransform as number[];
+    const zoom = vpt ? vpt[0] : 1;
+    // Convert to screen-space for pixel operations on the lower canvas
+    const cx = vpt ? x * zoom + vpt[4] : x;
+    const cy = vpt ? y * zoom + vpt[5] : y;
+    const r = Math.max(1, Math.round(bts.radius * zoom));
     const strength = bts.strength / 100;
-
-    // Read pixels in the radius, apply a box blur, write back
-    const r = Math.max(1, radius);
     const diameter = r * 2;
 
     try {
-      const imageData = ctx.getImageData(x - r, y - r, diameter, diameter);
-      const blurred = boxBlur(imageData, Math.ceil(r * strength * 0.3 + 1));
-      ctx.putImageData(blurred, x - r, y - r);
+      const sx = Math.round(cx - r);
+      const sy = Math.round(cy - r);
+      if (sx < 0 || sy < 0 || sx + diameter > lowerEl.width || sy + diameter > lowerEl.height) return;
+      const imageData = ctx.getImageData(sx, sy, diameter, diameter);
+      const passes = Math.max(1, Math.ceil(strength * 5));
+      const blurred = boxBlur(imageData, passes);
+      ctx.putImageData(blurred, sx, sy);
     } catch {
       // Possible cross-origin error — skip silently
     }

@@ -88,15 +88,34 @@ export default function Home() {
     setSavedProjects(loadSavedProjects());
   }, []);
 
+  // Toggle body class for overflow control: editor needs overflow:hidden, start page needs scroll
+  useEffect(() => {
+    if (editorOpen) {
+      document.body.classList.add('editor-open');
+    } else {
+      document.body.classList.remove('editor-open');
+    }
+    return () => { document.body.classList.remove('editor-open'); };
+  }, [editorOpen]);
+
   // Auto-save whenever project changes (after mount)
   useEffect(() => {
-    if (!mounted || !project.layers.length) return;
+    if (!mounted) return;
+    // Refresh saved projects list from localStorage to stay in sync
+    setSavedProjects(loadSavedProjects());
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mounted]);
+
+  // Save to localStorage on every project change
+  useEffect(() => {
+    if (!mounted) return;
     saveProjectToList(
       { id: project.id, name: project.name, updatedAt: project.updatedAt, canvas: project.canvas },
       useProjectStore.getState().project
     );
+    setSavedProjects(loadSavedProjects());
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.updatedAt]);
+  }, [project.updatedAt, project.id]);
 
   const openWithPreset = (preset: typeof CANVAS_PRESETS[0]) => {
     newProject({ width: preset.width, height: preset.height, name: preset.name });

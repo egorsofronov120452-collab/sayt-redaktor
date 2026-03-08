@@ -127,13 +127,18 @@
   }
   html, body {
     @apply bg-background text-foreground;
-    height: 100%;
-    overflow: hidden;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
-  #__next, main {
+  /* Editor mode: lock overflow so canvas fills the screen */
+  body.editor-open {
     height: 100%;
+    overflow: hidden;
+  }
+  body.editor-open #__next,
+  body.editor-open main {
+    height: 100%;
+    overflow: hidden;
   }
   ::-webkit-scrollbar {
     width: 6px;
