@@ -215,13 +215,13 @@ function LayerTrack({
           )}
         </div>
 
-        {/* Layer bar — colored based on layer type */}
+        {/* Layer bar — width based on layer type/duration */}
         <div className="flex-1 relative h-full overflow-hidden" style={{ marginLeft: 0 }}>
           <div
-            className="absolute top-2 bottom-2 rounded-sm opacity-40"
+            className="absolute top-2 bottom-2 rounded-sm opacity-40 cursor-ew-resize"
             style={{
-              left: 0,
-              width: duration * scale,
+              left: ((layer as any).videoStart ?? 0) * scale,
+              width: ((layer as any).videoEnd ?? (layer as any).duration ?? duration) * scale,
               backgroundColor: layer.type === 'text' ? '#4d9bff' :
                                layer.type === 'image' ? '#22c55e' :
                                layer.type === 'video' ? '#f59e0b' :
@@ -258,7 +258,7 @@ function LayerTrack({
 }
 
 export default function Timeline() {
-  const { project, selection, setSelection, addAnimation, updateAnimation } = useProjectStore();
+  const { project, selection, setSelection, addAnimation, updateAnimation, removeAnimation, setDuration } = useProjectStore();
   const { currentTime, timelinePlaying, timelineScale, setCurrentTime, setPlaying, setTimelineScale } = useEditorStore();
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -429,6 +429,23 @@ export default function Timeline() {
           <span className="text-[10px] text-muted-foreground">/ {msToTime(duration)}</span>
         </div>
 
+        {/* Duration control */}
+        <div className="flex items-center gap-1 ml-2">
+          <span className="text-[10px] text-muted-foreground">Длина:</span>
+          <input
+            type="number"
+            min={1}
+            value={Math.round(duration / 1000)}
+            onChange={(e) => {
+              const secs = Math.max(1, parseInt(e.target.value) || 1);
+              setDuration(secs * 1000);
+            }}
+            className="w-12 bg-black/30 border border-border rounded px-1 py-0.5 text-[11px] text-foreground font-mono outline-none focus:border-primary"
+            title="Длительность в секундах"
+          />
+          <span className="text-[10px] text-muted-foreground">с</span>
+        </div>
+
         <div className="flex-1" />
 
         {/* Zoom controls */}
@@ -436,7 +453,7 @@ export default function Timeline() {
         <button onClick={() => setTimelineScale(Math.max(scale / 1.5, 0.005))} className="w-6 h-6 flex items-center justify-center rounded hover:bg-white/10 text-muted-foreground"><ZoomOut size={12} /></button>
         <button onClick={() => setTimelineScale(Math.min(scale * 1.5, 2))} className="w-6 h-6 flex items-center justify-center rounded hover:bg-white/10 text-muted-foreground"><ZoomIn size={12} /></button>
 
-        {/* Add keyframe at current time for selected layer */}
+        {/* Add keyframe / delete animation for selected layer */}
         {selection[0] && (
           <>
             <div className="w-px h-5 bg-border mx-1" />
@@ -447,6 +464,15 @@ export default function Timeline() {
             >
               <Plus size={11} /> Анимировать
             </button>
+            {project.animations.find((a) => a.layerId === selection[0]) && (
+              <button
+                onClick={() => { if (selection[0]) removeAnimation(selection[0]); }}
+                className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-destructive/20 text-destructive text-[11px] hover:bg-destructive/30 transition-colors"
+                title="Удалить анимацию выбранного слоя"
+              >
+                <Trash2 size={11} /> Удалить анимацию
+              </button>
+            )}
           </>
         )}
       </div>
