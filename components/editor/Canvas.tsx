@@ -88,16 +88,21 @@ export default function Canvas() {
   const isDrawingRef = useRef(false);
   const initializedRef = useRef(false);
   const eraserModeRef = useRef(false);
+  const blurBrushRef = useRef(false);
   const animRafRef = useRef<number | null>(null);
-  // video elements map: layerId -> HTMLVideoElement
   const videoElemsRef = useRef<Map<string, HTMLVideoElement>>(new Map());
   const videoRafRef = useRef<number | null>(null);
   const cloneSourceRef = useRef<{ x: number; y: number } | null>(null);
+  // For eraser: raw canvas context strokes
+  const eraserLastPosRef = useRef<{ x: number; y: number } | null>(null);
+  // For blur brush: raw canvas context
+  const blurLastPosRef = useRef<{ x: number; y: number } | null>(null);
 
   const { project, addLayer, updateLayer, setSelection, pushHistory, setDuration } = useProjectStore();
   const {
     activeTool, zoom, showGrid, gridSize,
     brushSettings, eraserSettings, shapeSettings, textSettings,
+    blurToolSettings,
     setZoom, setPan, setActiveTool, currentTime, timelinePlaying, setCurrentTime,
   } = useEditorStore();
 
@@ -124,9 +129,13 @@ export default function Canvas() {
         renderOnAddRemove: true,
       });
 
-      canvas.freeDrawingBrush = new fb.PencilBrush(canvas);
-      canvas.freeDrawingBrush.color = brushSettings.color;
-      canvas.freeDrawingBrush.width = brushSettings.size;
+      // Brush: stroke-based, round caps, no fill
+      const brush = new fb.PencilBrush(canvas);
+      brush.color = brushSettings.color;
+      brush.width = brushSettings.size;
+      (brush as any).strokeLineCap = 'round';
+      (brush as any).strokeLineJoin = 'round';
+      canvas.freeDrawingBrush = brush;
 
       fabricRef.current = canvas as unknown as FabricCanvas;
       canvasInstance = canvas as unknown as FabricCanvas;
@@ -171,56 +180,111 @@ export default function Canvas() {
         pushHistory('Переместить объект');
       });
 
-      // Snap-to-objects while moving
+      // Snap-to-objects while moving — snap to edges AND centers of all nearby objects
       canvas.on('object:moving', (e: any) => {
         const { snapToLayers } = useEditorStore.getState();
         if (!snapToLayers) return;
         const obj = e.target as any;
-        const SNAP = 8;
+        const SNAP = 10;
         const others = canvas.getObjects().filter((o: any) => o !== obj && !o.data?.isGrid);
         const objB = obj.getBoundingRect(true);
 
+        const objCX = objB.left + objB.width / 2;
+        const objCY = objB.top + objB.height / 2;
+        const objRight = objB.left + objB.width;
+        const objBottom = objB.top + objB.height;
+
         for (const other of others) {
           const otherB = (other as any).getBoundingRect(true);
-          // Snap left edge to right edge or left edge
-          if (Math.abs(objB.left - otherB.left) < SNAP) { obj.set('left', otherB.left); }
-          else if (Math.abs(objB.left - (otherB.left + otherB.width)) < SNAP) { obj.set('left', otherB.left + otherB.width); }
-          // Snap top edge
-          if (Math.abs(objB.top - otherB.top) < SNAP) { obj.set('top', otherB.top); }
-          else if (Math.abs(objB.top - (otherB.top + otherB.height)) < SNAP) { obj.set('top', otherB.top + otherB.height); }
+          const otherRight = otherB.left + otherB.width;
+          const otherBottom = otherB.top + otherB.height;
+          const otherCX = otherB.left + otherB.width / 2;
+          const otherCY = otherB.top + otherB.height / 2;
+
+          // Horizontal snapping (X axis)
+          // left edge to left
+          if (Math.abs(objB.left - otherB.left) < SNAP) {
+            obj.set('left', otherB.left);
+          }
+          // left edge to right
+          else if (Math.abs(objB.left - otherRight) < SNAP) {
+            obj.set('left', otherRight);
+          }
+          // right edge to left
+          else if (Math.abs(objRight - otherB.left) < SNAP) {
+            obj.set('left', otherB.left - objB.width);
+          }
+          // right edge to right
+          else if (Math.abs(objRight - otherRight) < SNAP) {
+            obj.set('left', otherRight - objB.width);
+          }
+          // center to center X
+          else if (Math.abs(objCX - otherCX) < SNAP) {
+            obj.set('left', otherCX - objB.width / 2);
+          }
+
+          // Vertical snapping (Y axis)
+          if (Math.abs(objB.top - otherB.top) < SNAP) {
+            obj.set('top', otherB.top);
+          }
+          else if (Math.abs(objB.top - otherBottom) < SNAP) {
+            obj.set('top', otherBottom);
+          }
+          else if (Math.abs(objBottom - otherB.top) < SNAP) {
+            obj.set('top', otherB.top - objB.height);
+          }
+          else if (Math.abs(objBottom - otherBottom) < SNAP) {
+            obj.set('top', otherBottom - objB.height);
+          }
+          else if (Math.abs(objCY - otherCY) < SNAP) {
+            obj.set('top', otherCY - objB.height / 2);
+          }
         }
         obj.setCoords();
       });
 
-      // path:created — register brush/eraser stroke as a layer
+      // path:created — register brush stroke as a layer (NOT eraser — eraser is handled via raw canvas)
       canvas.on('path:created', (e: any) => {
         const path = e.path;
         if (!path) return;
         const wasEraser = eraserModeRef.current;
+        const wasBlur = blurBrushRef.current;
 
-        if (wasEraser) {
-          // For eraser: apply destination-out on the path
-          path.set({
-            globalCompositeOperation: 'destination-out',
-            selectable: true,
-            evented: true,
-          });
+        if (wasEraser || wasBlur) {
+          // Eraser/blur paths are handled at pixel level — remove the fabric path
+          canvas.remove(path);
+          canvas.requestRenderAll();
+          return;
         }
 
-        const layerName = wasEraser ? 'Ластик' : 'Мазок кисти';
+        // Brush stroke: keep stroke color, set fill to null
+        path.set({
+          fill: null,
+          stroke: brushSettings.color,
+          strokeWidth: brushSettings.size,
+          strokeLineCap: 'round',
+          strokeLineJoin: 'round',
+          opacity: brushSettings.opacity,
+          selectable: true,
+          evented: true,
+          data: { layerId: '', isBrushStroke: true },
+        });
+
         const layer = createLayer({
           type: 'shape',
-          name: layerName,
+          name: 'Мазок кисти',
           x: Math.round(path.left ?? 0),
           y: Math.round(path.top ?? 0),
           width: Math.round(path.width ?? 10),
           height: Math.round(path.height ?? 10),
-          fillColor: wasEraser ? 'transparent' : brushSettings.color,
+          strokeColor: brushSettings.color,
+          strokeWidth: brushSettings.size,
+          fillColor: undefined,
         });
-        path.set({ data: { layerId: layer.id } });
+        path.set({ data: { layerId: layer.id, isBrushStroke: true } });
         useProjectStore.getState().addLayer(layer);
         prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
-        pushHistory(layerName);
+        pushHistory('Мазок кисти');
         useEditorStore.getState().setActiveTool('select');
       });
 
@@ -255,7 +319,8 @@ export default function Canvas() {
       if (!canvas || canvas.disposed) return;
       let hasVideo = false;
       canvas.getObjects().forEach((obj: any) => {
-        if (obj.getElement?.()?.nodeName === 'VIDEO') {
+        const el = obj.getElement?.();
+        if (el && (el.nodeName === 'VIDEO' || el.tagName === 'VIDEO')) {
           obj.set('dirty', true);
           hasVideo = true;
         }
@@ -314,6 +379,9 @@ export default function Canvas() {
         const obj = canvas.getObjects().find((o: any) => o.data?.layerId === layer.id);
         if (!obj) continue;
 
+        // Skip brush strokes — they manage their own appearance
+        if (obj.data?.isBrushStroke) continue;
+
         let needsRender = false;
 
         if (obj.opacity !== (layer.opacity ?? 1)) { obj.set('opacity', layer.opacity ?? 1); needsRender = true; }
@@ -361,6 +429,17 @@ export default function Canvas() {
     })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.layers]);
+
+  // Update canvas background color and size when project.canvas changes
+  useEffect(() => {
+    const canvas = fabricRef.current as any;
+    if (!canvas) return;
+    if (canvas.backgroundColor !== project.backgroundColor) {
+      canvas.setBackgroundColor(project.backgroundColor ?? '#1a1a1f', () => {
+        canvas.requestRenderAll();
+      });
+    }
+  }, [project.backgroundColor]);
 
   // Fit canvas to container
   const fitCanvasToContainer = useCallback((canvas: any, container: HTMLDivElement | null) => {
@@ -434,9 +513,9 @@ export default function Canvas() {
         }
       }
 
-      // Also advance video elements to match currentTime
+      // Sync video elements to current time
       videoElemsRef.current.forEach((vid) => {
-        if (!vid.paused) return; // already playing
+        if (!vid.paused) return;
         const targetSecs = t / 1000;
         if (Math.abs(vid.currentTime - targetSecs) > 0.5) {
           vid.currentTime = targetSecs;
@@ -465,6 +544,9 @@ export default function Canvas() {
     canvas.off('mouse:move');
     canvas.off('mouse:up');
     eraserModeRef.current = false;
+    blurBrushRef.current = false;
+    eraserLastPosRef.current = null;
+    blurLastPosRef.current = null;
     canvas.getObjects().forEach((o: any) => {
       if (o.data?.isGrid) return;
       o.selectable = true;
@@ -481,29 +563,47 @@ export default function Canvas() {
       case 'brush': {
         canvas.isDrawingMode = true;
         eraserModeRef.current = false;
+        blurBrushRef.current = false;
         (async () => {
           const fb = await getFabric();
           const brush = new fb.PencilBrush(canvas);
           brush.color = brushSettings.color;
           brush.width = brushSettings.size;
-          (brush as any).opacity = brushSettings.opacity;
+          (brush as any).strokeLineCap = 'round';
+          (brush as any).strokeLineJoin = 'round';
+          (brush as any).globalCompositeOperation = 'source-over';
+          // Apply opacity through the color alpha channel
+          const hex = brushSettings.color.replace('#', '');
+          const r = parseInt(hex.substring(0, 2), 16);
+          const g = parseInt(hex.substring(2, 4), 16);
+          const b = parseInt(hex.substring(4, 6), 16);
+          brush.color = `rgba(${r},${g},${b},${brushSettings.opacity})`;
           canvas.freeDrawingBrush = brush;
         })();
         break;
       }
 
       case 'eraser': {
-        // Eraser: use white pencil brush with destination-out in path:created
-        canvas.isDrawingMode = true;
+        // Eraser: draw directly on the raw 2D canvas context using destination-out
+        canvas.isDrawingMode = false;
         eraserModeRef.current = true;
-        (async () => {
-          const fb = await getFabric();
-          const brush = new fb.PencilBrush(canvas);
-          // Visible color so user sees where they're erasing
-          brush.color = `rgba(255,255,255,${eraserSettings.opacity})`;
-          brush.width = eraserSettings.size;
-          canvas.freeDrawingBrush = brush;
-        })();
+        blurBrushRef.current = false;
+        canvas.defaultCursor = `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='${eraserSettings.size}' height='${eraserSettings.size}' viewBox='0 0 ${eraserSettings.size} ${eraserSettings.size}'><circle cx='${eraserSettings.size/2}' cy='${eraserSettings.size/2}' r='${eraserSettings.size/2-1}' fill='none' stroke='white' stroke-width='1.5'/></svg>") ${eraserSettings.size/2} ${eraserSettings.size/2}, crosshair`;
+        canvas.selection = false;
+        canvas.getObjects().forEach((o: any) => { o.selectable = false; o.evented = false; });
+        setupEraserTool(canvas);
+        break;
+      }
+
+      case 'blur': {
+        // Blur brush: paint blur on the canvas
+        canvas.isDrawingMode = false;
+        blurBrushRef.current = true;
+        eraserModeRef.current = false;
+        canvas.defaultCursor = 'crosshair';
+        canvas.selection = false;
+        canvas.getObjects().forEach((o: any) => { o.selectable = false; o.evented = false; });
+        setupBlurBrushTool(canvas);
         break;
       }
 
@@ -575,17 +675,11 @@ export default function Canvas() {
         canvas.defaultCursor = 'crosshair';
         setupGradientTool(canvas);
         break;
-
-      case 'blur':
-        canvas.selection = false;
-        canvas.defaultCursor = 'crosshair';
-        setupBlurTool(canvas);
-        break;
     }
 
     canvas.requestRenderAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTool, brushSettings, eraserSettings, shapeSettings, textSettings]);
+  }, [activeTool, brushSettings, eraserSettings, shapeSettings, textSettings, blurToolSettings]);
 
   // Sync zoom from store
   useEffect(() => {
@@ -669,31 +763,31 @@ export default function Canvas() {
         canvas.add(img);
         canvas.requestRenderAll();
       } catch (err) {
-        console.error('[v0] renderLayerToCanvas image error:', err);
+        console.error('[Canvas] renderLayerToCanvas image error:', err);
       }
       return;
     }
 
     if (layer.type === 'video' && layer.src) {
-      // Create or reuse video element
       let videoEl = videoElemsRef.current.get(layer.id);
       if (!videoEl) {
         videoEl = document.createElement('video');
+        // Don't set crossOrigin for blob URLs — they don't support CORS
+        const isBlobUrl = layer.src.startsWith('blob:');
+        if (!isBlobUrl) videoEl.crossOrigin = 'anonymous';
         videoEl.src = layer.src;
-        videoEl.crossOrigin = 'anonymous';
         videoEl.loop = true;
         videoEl.muted = true;
         videoEl.playsInline = true;
-        videoEl.autoplay = true;
         videoElemsRef.current.set(layer.id, videoEl);
       }
 
-      // Wait for video to be ready
       await new Promise<void>((res) => {
         if (videoEl!.readyState >= 2) { res(); return; }
         videoEl!.oncanplay = () => res();
+        videoEl!.onloadeddata = () => res();
         videoEl!.onerror = () => res();
-        setTimeout(res, 4000);
+        setTimeout(res, 5000);
       });
 
       const vw = videoEl.videoWidth || layer.width || 1280;
@@ -703,7 +797,6 @@ export default function Canvas() {
 
       let vidObj: any;
       try {
-        // fabric v6: new fb.Image(element, opts)
         vidObj = new fb.Image(videoEl, {
           left: layer.x ?? 0,
           top: layer.y ?? 0,
@@ -721,11 +814,20 @@ export default function Canvas() {
       }
 
       canvas.add(vidObj);
-      videoEl.play().catch(() => {});
+      // Attempt autoplay — might be blocked by browser policy
+      videoEl.play().catch(() => {
+        // On first user interaction, try again
+        const tryPlay = () => {
+          videoEl!.play().catch(() => {});
+          document.removeEventListener('click', tryPlay);
+          document.removeEventListener('keydown', tryPlay);
+        };
+        document.addEventListener('click', tryPlay, { once: true });
+        document.addEventListener('keydown', tryPlay, { once: true });
+      });
       canvas.requestRenderAll();
 
-      // Update duration if this video is longer than current
-      const vidDurationMs = (videoEl.duration || 0) * 1000;
+      const vidDurationMs = (videoEl.duration && isFinite(videoEl.duration)) ? videoEl.duration * 1000 : 0;
       if (vidDurationMs > 0 && vidDurationMs > useProjectStore.getState().project.duration) {
         useProjectStore.getState().setDuration(Math.ceil(vidDurationMs));
       }
@@ -753,6 +855,10 @@ export default function Canvas() {
     }
 
     if (layer.type === 'shape') {
+      // Brush stroke paths are stored with type 'shape' but are Path objects
+      // They should NOT be re-created as Rect — skip and let fabric handle via path:created
+      if (layer.name === 'Мазок кисти') return;
+
       let shape: any;
       const commonProps = {
         left: layer.x ?? 0,
@@ -788,22 +894,46 @@ export default function Canvas() {
         selectable: true,
         data: { layerId: layer.id },
       });
-      if (g.type === 'linear') {
-        rect.set('fill', new fb.Gradient({
-          type: 'linear',
-          gradientUnits: 'percentage',
-          coords: { x1: 0, y1: 0, x2: 1, y2: 0 },
-          colorStops: g.stops.map((s: any) => ({ offset: s.offset, color: s.color })),
-        }));
-      } else {
-        rect.set('fill', new fb.Gradient({
-          type: 'radial',
-          gradientUnits: 'percentage',
-          coords: { x1: 0.5, y1: 0.5, r1: 0, x2: 0.5, y2: 0.5, r2: 0.5 },
-          colorStops: g.stops.map((s: any) => ({ offset: s.offset, color: s.color })),
-        }));
-      }
+
+      const gradientDef = buildFabricGradient(fb, g, layer.width ?? project.canvas.width, layer.height ?? project.canvas.height);
+      rect.set('fill', gradientDef);
       canvas.add(rect);
+    }
+  }
+
+  // Build a fabric gradient object from our Gradient type
+  function buildFabricGradient(fb: any, g: import('@/store/types').Gradient, w: number, h: number) {
+    const angle = (g.angle ?? 0) * (Math.PI / 180);
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+
+    if (g.type === 'linear') {
+      return new fb.Gradient({
+        type: 'linear',
+        gradientUnits: 'pixels',
+        coords: {
+          x1: w / 2 - cos * w / 2,
+          y1: h / 2 - sin * h / 2,
+          x2: w / 2 + cos * w / 2,
+          y2: h / 2 + sin * h / 2,
+        },
+        colorStops: [...g.stops]
+          .sort((a, b) => a.offset - b.offset)
+          .map((s) => ({
+            offset: s.offset,
+            color: s.color,
+            opacity: s.opacity ?? 1,
+          })),
+      });
+    } else {
+      return new fb.Gradient({
+        type: 'radial',
+        gradientUnits: 'pixels',
+        coords: { x1: w / 2, y1: h / 2, r1: 0, x2: w / 2, y2: h / 2, r2: Math.max(w, h) / 2 },
+        colorStops: [...g.stops]
+          .sort((a, b) => a.offset - b.offset)
+          .map((s) => ({ offset: s.offset, color: s.color, opacity: s.opacity ?? 1 })),
+      });
     }
   }
 
@@ -838,28 +968,28 @@ export default function Canvas() {
         prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
         canvas.requestRenderAll();
       } catch (err) {
-        console.error('[v0] addFileToCanvas image error:', err);
+        console.error('[Canvas] addFileToCanvas image error:', err);
       }
       return;
     }
 
     if (file.type.startsWith('video/')) {
       const videoEl = document.createElement('video');
+      // Blob URLs don't need crossOrigin
       videoEl.src = url;
-      videoEl.crossOrigin = 'anonymous';
       videoEl.loop = true;
       videoEl.muted = true;
       videoEl.playsInline = true;
 
       await new Promise<void>((res) => {
-        videoEl.onloadeddata = () => res();
+        videoEl.onloadedmetadata = () => res();
         videoEl.onerror = () => res();
         setTimeout(res, 5000);
       });
 
       const vw = videoEl.videoWidth || 1280;
       const vh = videoEl.videoHeight || 720;
-      const durationMs = (videoEl.duration || 10) * 1000;
+      const durationMs = (videoEl.duration && isFinite(videoEl.duration)) ? Math.ceil(videoEl.duration * 1000) : 10000;
 
       const layer = createLayer({
         type: 'video',
@@ -867,6 +997,7 @@ export default function Canvas() {
         src: url,
         width: vw,
         height: vh,
+        videoStart: 0,
         videoEnd: durationMs,
       });
 
@@ -886,19 +1017,164 @@ export default function Canvas() {
       canvas.add(vidObj);
       canvas.setActiveObject(vidObj);
       videoElemsRef.current.set(layer.id, videoEl);
-      videoEl.play().catch(() => {});
+
+      videoEl.play().catch(() => {
+        const tryPlay = () => {
+          videoEl.play().catch(() => {});
+          document.removeEventListener('click', tryPlay);
+        };
+        document.addEventListener('click', tryPlay, { once: true });
+      });
 
       useProjectStore.getState().addLayer(layer);
       prevLayerCountRef.current = useProjectStore.getState().project.layers.length;
 
-      // Extend project duration if needed
+      // Extend project duration if video is longer
       const currentDuration = useProjectStore.getState().project.duration;
       if (durationMs > currentDuration) {
-        useProjectStore.getState().setDuration(Math.ceil(durationMs));
+        useProjectStore.getState().setDuration(durationMs);
       }
 
       canvas.requestRenderAll();
     }
+  }
+
+  // ─── Tool setups ────────────────────────────────────────────────────────────
+
+  function setupEraserTool(canvas: any) {
+    // Get the raw 2D canvas context and paint with destination-out
+    const rawEl: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
+
+    const getCanvasPoint = (e: MouseEvent | TouchEvent) => {
+      const el: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
+      if (!el) return { x: 0, y: 0 };
+      const rect = el.getBoundingClientRect();
+      const clientX = 'touches' in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
+      const clientY = 'touches' in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
+      const x = (clientX - rect.left);
+      const y = (clientY - rect.top);
+      return { x, y };
+    };
+
+    canvas.on('mouse:down', (opt: any) => {
+      isDrawingRef.current = true;
+      const pt = getCanvasPoint(opt.e);
+      eraserLastPosRef.current = pt;
+      eraserPaintAt(canvas, rawEl, pt.x, pt.y, pt.x, pt.y);
+    });
+
+    canvas.on('mouse:move', (opt: any) => {
+      if (!isDrawingRef.current) return;
+      const pt = getCanvasPoint(opt.e);
+      const last = eraserLastPosRef.current ?? pt;
+      eraserPaintAt(canvas, rawEl, last.x, last.y, pt.x, pt.y);
+      eraserLastPosRef.current = pt;
+    });
+
+    canvas.on('mouse:up', () => {
+      isDrawingRef.current = false;
+      eraserLastPosRef.current = null;
+    });
+  }
+
+  function eraserPaintAt(canvas: any, rawEl: HTMLCanvasElement, x1: number, y1: number, x2: number, y2: number) {
+    if (!rawEl) return;
+    const ctx = rawEl.getContext('2d');
+    if (!ctx) return;
+    const { eraserSettings: es } = useEditorStore.getState();
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.strokeStyle = `rgba(0,0,0,${es.opacity})`;
+    ctx.lineWidth = es.size;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.stroke();
+    ctx.restore();
+    // Don't call requestRenderAll — that would re-draw fabric objects over our erased content
+  }
+
+  function setupBlurBrushTool(canvas: any) {
+    const rawEl: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
+
+    const getCanvasPoint = (e: MouseEvent) => {
+      const el: HTMLCanvasElement = canvas.getElement?.() ?? canvasRef.current;
+      if (!el) return { x: 0, y: 0 };
+      const rect = el.getBoundingClientRect();
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    };
+
+    canvas.on('mouse:down', (opt: any) => {
+      isDrawingRef.current = true;
+      const pt = getCanvasPoint(opt.e);
+      blurLastPosRef.current = pt;
+      blurPaintAt(rawEl, pt.x, pt.y);
+    });
+
+    canvas.on('mouse:move', (opt: any) => {
+      if (!isDrawingRef.current) return;
+      const pt = getCanvasPoint(opt.e);
+      blurPaintAt(rawEl, pt.x, pt.y);
+      blurLastPosRef.current = pt;
+    });
+
+    canvas.on('mouse:up', () => {
+      isDrawingRef.current = false;
+      blurLastPosRef.current = null;
+    });
+  }
+
+  function blurPaintAt(rawEl: HTMLCanvasElement, x: number, y: number) {
+    if (!rawEl) return;
+    const ctx = rawEl.getContext('2d');
+    if (!ctx) return;
+    const { blurToolSettings: bts } = useEditorStore.getState();
+    const radius = bts.radius;
+    const strength = bts.strength / 100;
+
+    // Read pixels in the radius, apply a box blur, write back
+    const r = Math.max(1, radius);
+    const diameter = r * 2;
+
+    try {
+      const imageData = ctx.getImageData(x - r, y - r, diameter, diameter);
+      const blurred = boxBlur(imageData, Math.ceil(r * strength * 0.3 + 1));
+      ctx.putImageData(blurred, x - r, y - r);
+    } catch {
+      // Possible cross-origin error — skip silently
+    }
+  }
+
+  function boxBlur(imageData: ImageData, passes: number): ImageData {
+    const { data, width, height } = imageData;
+    const result = new Uint8ClampedArray(data);
+    const temp = new Uint8ClampedArray(data);
+
+    for (let p = 0; p < passes; p++) {
+      // Horizontal pass
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          let r = 0, g = 0, b = 0, a = 0, count = 0;
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx;
+            if (nx < 0 || nx >= width) continue;
+            const idx = (y * width + nx) * 4;
+            r += temp[idx]; g += temp[idx + 1]; b += temp[idx + 2]; a += temp[idx + 3];
+            count++;
+          }
+          const idx = (y * width + x) * 4;
+          result[idx] = r / count;
+          result[idx + 1] = g / count;
+          result[idx + 2] = b / count;
+          result[idx + 3] = a / count;
+        }
+      }
+      temp.set(result);
+    }
+
+    return new ImageData(result, width, height);
   }
 
   function setupPanTool(canvas: any) {
@@ -1149,7 +1425,7 @@ export default function Canvas() {
           width: 1, height: 1,
           stroke: '#ffffff', strokeWidth: 1,
           strokeDashArray: [5, 5],
-          fill: 'rgba(255,255,255,0.05)',
+          fill: 'rgba(255,255,255,0.08)',
           selectable: false, evented: false,
         });
         canvas.add(cropRect);
@@ -1174,22 +1450,21 @@ export default function Canvas() {
         const cropW = cropRect.width ?? 0;
         const cropH = cropRect.height ?? 0;
 
-        if (cropW > 10 && cropH > 10) {
-          // Crop the selected image layer by applying clipPath
+        if (cropW > 5 && cropH > 5) {
           const activeObj = canvas.getActiveObject() as any;
           (async () => {
             const fb = await getFabric();
             if (activeObj && activeObj.data?.layerId) {
-              // Apply a clip rect to the image object
+              // Use absolutePositioned: true so clip is in canvas (world) coordinates
               const clip = new fb.Rect({
-                left: cropL - (activeObj.left ?? 0),
-                top: cropT - (activeObj.top ?? 0),
+                left: cropL,
+                top: cropT,
                 width: cropW,
                 height: cropH,
-                absolutePositioned: false,
+                absolutePositioned: true,
               });
               activeObj.clipPath = clip;
-              // Update layer dimensions in store
+              // Update layer bounds in store to reflect the cropped region
               const layerId = activeObj.data.layerId;
               useProjectStore.getState().updateLayer(layerId, {
                 x: Math.round(cropL),
@@ -1267,23 +1542,31 @@ export default function Canvas() {
       const endPoint = canvas.getPointer(opt.e);
       const activeObj = canvas.getActiveObject() as any;
 
+      const primaryColor = useEditorStore.getState().activeColor;
+      const secondaryColor = useEditorStore.getState().secondaryColor;
+
       if (activeObj) {
         (async () => {
           const fb = await getFabric();
-          const w = activeObj.width ?? 100;
-          const h = activeObj.height ?? 100;
-          const primaryColor = useEditorStore.getState().activeColor;
-          const secondaryColor = useEditorStore.getState().secondaryColor;
+          const w = (activeObj.width ?? 100) * (activeObj.scaleX ?? 1);
+          const h = (activeObj.height ?? 100) * (activeObj.scaleY ?? 1);
+          const objLeft = activeObj.left ?? 0;
+          const objTop = activeObj.top ?? 0;
+
+          // Normalize drag coords relative to the object
+          let x1 = (startPoint!.x - objLeft) / w;
+          let y1 = (startPoint!.y - objTop) / h;
+          let x2 = (endPoint.x - objLeft) / w;
+          let y2 = (endPoint.y - objTop) / h;
+
+          // If no drag, default to left→right
+          const dist = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+          if (dist < 0.02) { x1 = 0; y1 = 0.5; x2 = 1; y2 = 0.5; }
 
           const gradient = new fb.Gradient({
             type: 'linear',
             gradientUnits: 'percentage',
-            coords: {
-              x1: (startPoint!.x - (activeObj.left ?? 0)) / w,
-              y1: (startPoint!.y - (activeObj.top ?? 0)) / h,
-              x2: (endPoint.x - (activeObj.left ?? 0)) / w,
-              y2: (endPoint.y - (activeObj.top ?? 0)) / h,
-            },
+            coords: { x1, y1, x2, y2 },
             colorStops: [
               { offset: 0, color: primaryColor },
               { offset: 1, color: secondaryColor },
@@ -1306,27 +1589,35 @@ export default function Canvas() {
           }
         })();
       } else {
-        // No object selected: create a new gradient layer
+        // No object selected: create a new gradient layer covering the canvas
         (async () => {
           const fb = await getFabric();
-          const primaryColor = useEditorStore.getState().activeColor;
-          const secondaryColor = useEditorStore.getState().secondaryColor;
-          const rect = new fb.Rect({
-            left: 0, top: 0,
-            width: project.canvas.width,
-            height: project.canvas.height,
-            selectable: true,
+          const w = project.canvas.width;
+          const h = project.canvas.height;
+
+          const gradientDef = new fb.Gradient({
+            type: 'linear',
+            gradientUnits: 'pixels',
+            coords: {
+              x1: startPoint!.x,
+              y1: startPoint!.y,
+              x2: endPoint.x,
+              y2: endPoint.y,
+            },
+            colorStops: [
+              { offset: 0, color: primaryColor },
+              { offset: 1, color: secondaryColor },
+            ],
           });
-          rect.set('fill', new fb.Gradient({
-            type: 'linear', gradientUnits: 'percentage',
-            coords: { x1: 0, y1: 0, x2: 1, y2: 0 },
-            colorStops: [{ offset: 0, color: primaryColor }, { offset: 1, color: secondaryColor }],
-          }));
+
+          const rect = new fb.Rect({
+            left: 0, top: 0, width: w, height: h, selectable: true,
+          });
+          rect.set('fill', gradientDef);
+
           const layer = createLayer({
             type: 'gradient', name: 'Градиент',
-            x: 0, y: 0,
-            width: project.canvas.width,
-            height: project.canvas.height,
+            x: 0, y: 0, width: w, height: h,
             gradient: { type: 'linear', angle: 0, stops: [
               { id: '1', offset: 0, color: primaryColor, opacity: 1 },
               { id: '2', offset: 1, color: secondaryColor, opacity: 1 },
@@ -1343,37 +1634,6 @@ export default function Canvas() {
 
       startPoint = null;
       setActiveTool('select');
-    });
-  }
-
-  function setupBlurTool(canvas: any) {
-    // Blur brush: on click, apply gaussian blur filter to the selected image object
-    canvas.on('mouse:down', (opt: any) => {
-      const activeObj = canvas.getActiveObject() as any;
-      if (!activeObj) return;
-      const { blurToolSettings } = useEditorStore.getState();
-      (async () => {
-        const fb = await getFabric();
-        const BlurFilter = (fb as any).filters?.Blur ?? (fb as any).Image?.filters?.Blur;
-        if (!BlurFilter) return;
-
-        const existing = (activeObj.filters ?? []).filter((f: any) => f.type !== 'Blur');
-        const blurFilter = new BlurFilter({ blur: blurToolSettings.radius / 100 });
-        activeObj.filters = [...existing, blurFilter];
-        activeObj.applyFilters?.();
-        canvas.requestRenderAll();
-
-        const layerId = activeObj.data?.layerId;
-        if (layerId) {
-          useProjectStore.getState().updateLayer(layerId, {
-            effects: {
-              ...useProjectStore.getState().project.layers.find((l) => l.id === layerId)?.effects,
-              blur: { type: 'gaussian', radius: blurToolSettings.radius, angle: 0, strength: 50 },
-            },
-          });
-        }
-        pushHistory('Размытие');
-      })();
     });
   }
 

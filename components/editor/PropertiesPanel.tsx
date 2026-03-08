@@ -2,14 +2,16 @@
 
 import { useState } from 'react';
 import { useProjectStore } from '@/store/projectStore';
+import { useEditorStore } from '@/store/editorStore';
 import type { Layer, ColorAdjustments, LayerEffects, TextStyle } from '@/store/types';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import {
   ChevronDown, ChevronRight, Wand2, RotateCw, FlipHorizontal, FlipVertical,
-  SunMedium, Contrast, Droplets, Wind, Zap, Mountain, AlignLeft, AlignCenter,
+  SunMedium, AlignLeft, AlignCenter,
   AlignRight, Bold, Italic, Underline, Plus, Trash2,
+  Paintbrush, Eraser,
 } from 'lucide-react';
 import { nanoid } from 'nanoid';
 
@@ -448,10 +450,100 @@ function BlurSection({ layer, update }: { layer: Layer; update: (p: Partial<Laye
   );
 }
 
+// ---- Brush Settings Panel ----
+function BrushSettingsPanel() {
+  const { brushSettings, updateBrush } = useEditorStore();
+  return (
+    <div className="flex flex-col h-full panel-bg overflow-y-auto text-xs">
+      <div className="flex items-center gap-2 px-2 py-1.5 border-b panel-border shrink-0 panel-header">
+        <Paintbrush size={13} className="text-primary" />
+        <span className="text-xs font-semibold text-foreground tracking-wide uppercase">Кисть</span>
+      </div>
+      <div className="px-2 py-2 space-y-0.5">
+        <SliderRow label="Размер" value={brushSettings.size} onChange={(v) => updateBrush({ size: v })} min={1} max={200} unit="px" hint="Размер кисти в пикселях" />
+        <SliderRow label="Непрозрачность" value={Math.round(brushSettings.opacity * 100)} onChange={(v) => updateBrush({ opacity: v / 100 })} min={1} max={100} unit="%" hint="Непрозрачность мазка" />
+        <SliderRow label="Жёсткость" value={brushSettings.hardness} onChange={(v) => updateBrush({ hardness: v })} min={0} max={100} unit="%" hint="Жёсткость краёв кисти" />
+        <PropRow label="Цвет">
+          <ColorSwatch value={brushSettings.color} onChange={(v) => updateBrush({ color: v })} />
+        </PropRow>
+        <PropRow label="Режим">
+          <select
+            value={brushSettings.mode}
+            onChange={(e) => updateBrush({ mode: e.target.value as any })}
+            className="w-full bg-input border border-border rounded-sm px-1.5 py-0.5 text-[11px] text-foreground outline-none"
+          >
+            <option value="normal">Обычный</option>
+            <option value="multiply">Умножение</option>
+            <option value="screen">Экран</option>
+            <option value="overlay">Перекрытие</option>
+          </select>
+        </PropRow>
+      </div>
+    </div>
+  );
+}
+
+// ---- Eraser Settings Panel ----
+function EraserSettingsPanel() {
+  const { eraserSettings, updateEraser } = useEditorStore();
+  return (
+    <div className="flex flex-col h-full panel-bg overflow-y-auto text-xs">
+      <div className="flex items-center gap-2 px-2 py-1.5 border-b panel-border shrink-0 panel-header">
+        <Eraser size={13} className="text-primary" />
+        <span className="text-xs font-semibold text-foreground tracking-wide uppercase">Ластик</span>
+      </div>
+      <div className="px-2 py-2 space-y-0.5">
+        <SliderRow label="Размер" value={eraserSettings.size} onChange={(v) => updateEraser({ size: v })} min={1} max={300} unit="px" hint="Диаметр ластика" />
+        <SliderRow label="Непрозрачность" value={Math.round(eraserSettings.opacity * 100)} onChange={(v) => updateEraser({ opacity: v / 100 })} min={1} max={100} unit="%" hint="Сила стирания" />
+        <SliderRow label="Жёсткость" value={eraserSettings.hardness} onChange={(v) => updateEraser({ hardness: v })} min={0} max={100} unit="%" hint="Жёсткость краёв ластика" />
+        <div className="mt-2 p-2 bg-black/20 rounded text-[10px] text-muted-foreground leading-relaxed">
+          Ластик стирает пиксели прямо с холста. Рисуйте по области которую нужно удалить.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Blur Brush Settings Panel ----
+function BlurBrushSettingsPanel() {
+  const { blurToolSettings, updateBlurTool } = useEditorStore();
+  return (
+    <div className="flex flex-col h-full panel-bg overflow-y-auto text-xs">
+      <div className="flex items-center gap-2 px-2 py-1.5 border-b panel-border shrink-0 panel-header">
+        <span className="text-xs font-semibold text-foreground tracking-wide uppercase">Размытие-кисть</span>
+      </div>
+      <div className="px-2 py-2 space-y-0.5">
+        <SliderRow label="Размер" value={blurToolSettings.radius} onChange={(v) => updateBlurTool({ radius: v })} min={1} max={100} unit="px" hint="Радиус области размытия" />
+        <SliderRow label="Сила" value={blurToolSettings.strength} onChange={(v) => updateBlurTool({ strength: v })} min={1} max={100} unit="%" hint="Интенсивность размытия" />
+        <PropRow label="Тип">
+          <select
+            value={blurToolSettings.type}
+            onChange={(e) => updateBlurTool({ type: e.target.value as any })}
+            className="w-full bg-input border border-border rounded-sm px-1.5 py-0.5 text-[11px] text-foreground outline-none"
+          >
+            <option value="gaussian">По Гауссу</option>
+            <option value="motion">В движении</option>
+            <option value="radial">Радиальное</option>
+          </select>
+        </PropRow>
+        <div className="mt-2 p-2 bg-black/20 rounded text-[10px] text-muted-foreground leading-relaxed">
+          Размытие-кисть: рисуйте по области которую хотите размыть. Чем сильнее нажатие — тем больше размытие.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---- Main PropertiesPanel ----
 export default function PropertiesPanel() {
   const { project, selection, updateLayer } = useProjectStore();
+  const { activeTool } = useEditorStore();
   const layer = project.layers.find((l) => l.id === selection[0]);
+
+  // Show tool-specific settings when brush/eraser/blur tools are active
+  if (activeTool === 'brush') return <BrushSettingsPanel />;
+  if (activeTool === 'eraser') return <EraserSettingsPanel />;
+  if (activeTool === 'blur') return <BlurBrushSettingsPanel />;
 
   if (!layer) {
     return (

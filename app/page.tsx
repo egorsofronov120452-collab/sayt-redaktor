@@ -182,8 +182,8 @@ export default function Home() {
 
   return (
     <div
-      className="min-h-screen bg-[#141418] flex flex-col items-center py-10 px-8 font-sans"
-      style={{ overflowY: 'auto' }}
+      className="bg-[#141418] flex flex-col items-center py-10 px-8 font-sans"
+      style={{ minHeight: '100vh', overflowY: 'auto', overflowX: 'hidden' }}
       onDragOver={handlePageDragOver}
       onDragLeave={handlePageDragLeave}
       onDrop={handlePageDrop}
@@ -322,7 +322,7 @@ export default function Home() {
               <Clock size={14} className="text-[#4d9bff]" />
               <span className="text-sm font-semibold text-white">Сохранённые проекты</span>
             </div>
-            <div className="p-2 overflow-y-auto max-h-60">
+            <div className="p-2 overflow-y-auto" style={{ maxHeight: '60vh' }}>
               {!mounted ? null : savedProjects.length === 0 ? (
                 <div className="px-2 py-4 text-center text-[11px] text-white/30">
                   Нет сохранённых проектов
